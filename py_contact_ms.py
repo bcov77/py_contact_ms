@@ -314,7 +314,7 @@ class AtomView:
 
     # ── identity / ordering (matching Atom semantics) ─────────────────────
 
-    def __eq__(self, other):  return self is other
+    def __eq__(self, other):  return self.natom == other.natom
     def __le__(self, other):  return self.natom <= other.natom
     def __hash__(self):       return id(self)
 
@@ -578,6 +578,12 @@ class ProbeArray:
             setattr(self, f, getattr(self, f)[:self._n].copy())
 
 
+class SimpleNeighborArray:
+    '''
+    Store the information needed to work with neighbors
+    '''
+
+
 ATTEN_BLOCKER = 1
 ATTEN_2 = 2
 ATTEN_BURIED_FLAGGED = 5
@@ -778,7 +784,7 @@ class MolecularSurfaceCalculator:
         if atom.radius > 0:
             atom.density  = self.settings.density
             atom.molecule = 1 if molecule == 1 else 0
-            atom.natom    = len(self.run.atoms) + 1
+            atom.natom    = len(self.run.atoms)
             atom.access   = 0
 
             self.run.atoms.append(atom)  # copies into AtomArray, returns AtomView (unused here)
@@ -936,26 +942,20 @@ class MolecularSurfaceCalculator:
 
         # Generate convex surfaces
         for iatom, atom1 in enumerate(self.run.atoms):
-            debug = iatom == 0
 
             if atom1.atten <= 0:
-                assert not debug
                 continue
 
             if not self.find_neighbors_and_buried_atoms(atom1):
-                assert not debug
                 continue
 
             if not atom1.access:
-                assert not debug
                 continue
 
             if atom1.atten <= ATTEN_BLOCKER:
-                assert not debug
                 continue
 
             if atom1.atten == ATTEN_6 and not atom1.buried:
-                assert not debug
                 continue
 
             self.generate_convex_surface(atom1)
