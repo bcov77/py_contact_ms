@@ -13,6 +13,10 @@ class Vec3:
         self.y_ = float(y)
         self.z_ = float(z)
 
+    @staticmethod
+    def from_xyz(xyz):
+        return Vec3(xyz[0], xyz[1], xyz[2])
+
     def x(self, value=None):
         if value is None:
             return self.x_
@@ -72,6 +76,8 @@ class Vec3:
     def distance_squared(self, other):
         return (self - other).magnitude_squared()
 
+    def to_numpy(self):
+        return np.array([self.x_, self.y_, self.z_])
 
 class Atom(Vec3):
 
@@ -583,38 +589,19 @@ class SimpleNeighborArray:
     Store the information needed to work with neighbors
     '''
 
-    _INITIAL_CAP = 256
 
-    def __init__(self, max_neighbors, initial_cap=None):
-        cap = initial_cap or self._INITIAL_CAP
-        self._n   = 0
+    def __init__(self, cap, max_neighbors):
         self._cap = cap
         self._max_neighbors = max_neighbors
 
-        self._refresh(cap)
-
-        self._keys = ['xyz', 'radius', 'neighbors']
-
-    def _refresh(self, cap):
-
         self.xyz = np.full((cap, max_neighbors, 3), np.nan, dtype=np.float64)
         self.radius = np.full((cap, max_neighbors), np.nan, dtype=np.float64)
-        self.neighbors = np.zeros((cap,), dtype=np.int32)
+        self.natom = np.full((cap, max_neighbors), -1, dtype=np.int32)
+        self.nneighbors = np.zeros((cap,), dtype=np.int32)
 
-    def _grow(self):
-        new_cap = self._cap * 2
 
-        olds = {key:getattr(self, key) for key in self._keys}
-        self._refresh(new_cap)
-
-        for key in self._keys:
-            new = getattr(self, key)
-            new[:self._n] = olds[key][:self._n]
-            setattr(self, key, new)
-        self._cap = new_cap
-
-    def __len__(self):   return self._n
-    def __bool__(self):  return self._n > 0
+    def __len__(self):   return self._cap
+    def __bool__(self):  return self._cap > 0
 
 
 ATTEN_BLOCKER = 1
@@ -655,6 +642,7 @@ class MolecularSurfaceCalculator:
         self.run.probes     = ProbeArray(self.run.atoms)
         self.run.prevp      = Vec3()
         self.run.prevburied = 0
+        self.run.neighborArray = None
 
 
     def calc(self, pose, jump_id=1):
@@ -962,6 +950,21 @@ class MolecularSurfaceCalculator:
 
         return 1
 
+    def generate_neighbor_array(self):
+        max_neighbors = 0
+        for atom in self.run.atoms:
+            max_neighbors = max(max_neighbors, len(atom.neighbors))
+
+        self.run.neighbor_array = SimpleNeighborArray(len(self.run.atoms), max_neighbors)
+        for iatom, atom in enumerate(self.run.atoms):
+            n = len(atom.neighbors)
+            self.run.neighbor_array.xyz[iatom, :n, 0] = [x.x_ for x in atom.neighbors]
+            self.run.neighbor_array.xyz[iatom, :n, 1] = [x.y_ for x in atom.neighbors]
+            self.run.neighbor_array.xyz[iatom, :n, 2] = [x.z_ for x in atom.neighbors]
+            self.run.neighbor_array.radius[iatom, :n] = [x.radius for x in atom.neighbors]
+            self.run.neighbor_array.natom[iatom, :n] = [x.natom for x in atom.neighbors]
+            self.run.neighbor_array.nneighbors[iatom] = n
+
     def calc_dots_for_all_atoms(self, _atoms_unused):
         """
         Main surface generation loop.
@@ -982,6 +985,9 @@ class MolecularSurfaceCalculator:
                 continue
             atom1.neighbors.sort(key=lambda a: atom1.distance(a))
             good_atom[iatom] = True
+
+
+        self.generate_neighbor_array()
 
 
         # Generate convex surfaces
@@ -1014,22 +1020,6 @@ class MolecularSurfaceCalculator:
 
         return 1
 
-    def _distance_key(self, ref_atom):
-        def key(atom):
-            return ref_atom.distance(atom)
-        return key
-
-    def find_neighbors_and_buried_atoms(self, atom1):
-
-        if not self.find_neighbors_for_atom(atom1):
-            return 0
-
-        # sort neighbors by distance
-        atom1.neighbors.sort(key=lambda a: atom1.distance(a))
-
-        self.second_loop(atom1)
-
-        return len(atom1.neighbors)
 
     import math
 
@@ -1249,7 +1239,7 @@ class MolecularSurfaceCalculator:
 
     def generate_convex_surface(self, atom1):
 
-        neighbors = atom1.neighbors
+        # neighbors = atom1.neighbors
 
         north = Vec3(0, 0, 1)
         south = Vec3(0, 0, -1)
@@ -1258,9 +1248,10 @@ class MolecularSurfaceCalculator:
         ri = atom1.radius
         eri = atom1.radius + self.settings.rp
 
-        if neighbors:
+        if self.run.neighbor_array.nneighbors[atom1.natom]:
 
-            neighbor = neighbors[0]
+            neighbor = Vec3.from_xyz(self.run.neighbor_array.xyz[atom1.natom,0])
+            neighbor_rad = self.run.neighbor_array.radius[atom1.natom,0]
 
             north = atom1 - neighbor
             north.normalize()
@@ -1281,8 +1272,8 @@ class MolecularSurfaceCalculator:
 
             vql = eqvec.cross(north)
 
-            rj = neighbor.radius
-            erj = neighbor.radius + self.settings.rp
+            rj = neighbor_rad
+            erj = neighbor_rad + self.settings.rp
 
             dij = atom1.distance(neighbor)
             uij = (neighbor - atom1) / dij
@@ -1340,7 +1331,9 @@ class MolecularSurfaceCalculator:
 
                 pcen = atom1 + ((point - atom1) * (eri/ri))
 
-                if self.check_point_collision(pcen, neighbors):
+                # if self.check_point_collision(pcen, neighbors):
+                #     continue
+                if self.check_point_collision_array(pcen, self.run.neighbor_array.xyz[atom1.natom], self.run.neighbor_array.radius[atom1.natom]):
                     continue
 
                 self.run.results.dots.convex += 1
@@ -1364,6 +1357,16 @@ class MolecularSurfaceCalculator:
                 return 1
 
         return 0
+
+    def check_point_collision_array(self, pcen, xyzs, rads):
+
+        # skip first neighbor (matches C++ begin()+1)
+        pcen_np = pcen.to_numpy()
+        dists = np.linalg.norm(xyzs - pcen_np, axis=-1)
+        collision = (dists <= (rads + self.settings.rp)) & ~np.isnan(rads) 
+
+        return collision[1:].any()
+
 
 
     import math
