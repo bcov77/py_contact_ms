@@ -5,6 +5,7 @@ import sys
 sys.path.append('/home/bcov/sc/random/npose')
 import npose_util as nu
 import numpy as np
+from scipy.spatial.distance import cdist
 
 class Vec3:
     def __init__(self, x=0.0, y=0.0, z=0.0):
@@ -154,6 +155,429 @@ from pyrosetta.rosetta import *
 init('-mute all')
 
 
+# ── Struct-of-Arrays containers ───────────────────────────────────────────────
+#
+# AtomArray / AtomView  – drop-in replacement for list[Atom]
+# DotArray              – replaces list[DOT]  (no view class needed)
+# ProbeArray / ProbeView – replaces list[PROBE]
+#
+# Design goals
+#   • All numeric data lives in pre-allocated numpy arrays (SoA layout).
+#   • AtomView / ProbeView are *cached* proxy objects: atoms[i] always returns
+#     the same Python object, so "atom1 is atom2" identity checks remain valid.
+#   • The three-loop surface algorithm continues to work unmodified because
+#     AtomView exposes the same attribute / method interface as the old Atom
+#     class (x_, y_, z_, atten, neighbors, …).
+#   • Vectorised callers (assign_attention_numbers, calc_contact_molecular_
+#     surface) operate directly on the numpy arrays for O(N²) → numpy speed.
+
+class AtomView:
+    """
+    Proxy to a single row in an AtomArray.
+
+    Scalar numeric fields (x_, y_, z_, radius, …) are backed by numpy arrays
+    inside the parent AtomArray.  Per-atom variable-length lists (neighbors,
+    buried) are stored as ordinary Python lists on the view object itself.
+    """
+
+    # These live on the view instance, not in the numpy arrays.
+    _LOCAL = frozenset({'_arr', '_idx', 'neighbors', 'buried'})
+
+    def __init__(self, arr, idx):
+        object.__setattr__(self, '_arr',      arr)
+        object.__setattr__(self, '_idx',      idx)
+        object.__setattr__(self, 'neighbors', [])
+        object.__setattr__(self, 'buried',    [])
+
+    # ── numpy-backed scalar properties ────────────────────────────────────
+
+    @property
+    def x_(self):            return float(self._arr.x[self._idx])
+    @x_.setter
+    def x_(self, v):         self._arr.x[self._idx] = v
+
+    @property
+    def y_(self):            return float(self._arr.y[self._idx])
+    @y_.setter
+    def y_(self, v):         self._arr.y[self._idx] = v
+
+    @property
+    def z_(self):            return float(self._arr.z[self._idx])
+    @z_.setter
+    def z_(self, v):         self._arr.z[self._idx] = v
+
+    @property
+    def natom(self):         return int(self._arr.natom[self._idx])
+    @natom.setter
+    def natom(self, v):      self._arr.natom[self._idx] = v
+
+    @property
+    def nresidue(self):      return int(self._arr.nresidue[self._idx])
+    @nresidue.setter
+    def nresidue(self, v):   self._arr.nresidue[self._idx] = v
+
+    @property
+    def molecule(self):      return int(self._arr.molecule[self._idx])
+    @molecule.setter
+    def molecule(self, v):   self._arr.molecule[self._idx] = v
+
+    @property
+    def radius(self):        return float(self._arr.radius[self._idx])
+    @radius.setter
+    def radius(self, v):     self._arr.radius[self._idx] = v
+
+    @property
+    def density(self):       return float(self._arr.density[self._idx])
+    @density.setter
+    def density(self, v):    self._arr.density[self._idx] = v
+
+    @property
+    def atten(self):         return int(self._arr.atten[self._idx])
+    @atten.setter
+    def atten(self, v):      self._arr.atten[self._idx] = v
+
+    @property
+    def access(self):        return int(self._arr.access[self._idx])
+    @access.setter
+    def access(self, v):     self._arr.access[self._idx] = v
+
+    # String fields stored in Python lists inside AtomArray
+    @property
+    def atom(self):          return self._arr.atom_name[self._idx]
+    @atom.setter
+    def atom(self, v):       self._arr.atom_name[self._idx] = v
+
+    @property
+    def residue(self):       return self._arr.residue_name[self._idx]
+    @residue.setter
+    def residue(self, v):    self._arr.residue_name[self._idx] = v
+
+    # ── Vec3-compatible interface ──────────────────────────────────────────
+
+    def x(self, value=None):
+        if value is None: return self.x_
+        self.x_ = float(value)
+
+    def y(self, value=None):
+        if value is None: return self.y_
+        self.y_ = float(value)
+
+    def z(self, value=None):
+        if value is None: return self.z_
+        self.z_ = float(value)
+
+    def __add__(self, other):
+        return Vec3(self.x_ + other.x_, self.y_ + other.y_, self.z_ + other.z_)
+
+    def __sub__(self, other):
+        return Vec3(self.x_ - other.x_, self.y_ - other.y_, self.z_ - other.z_)
+
+    def __mul__(self, scalar):
+        return Vec3(self.x_ * scalar, self.y_ * scalar, self.z_ * scalar)
+
+    def __truediv__(self, scalar):
+        return Vec3(self.x_ / scalar, self.y_ / scalar, self.z_ / scalar)
+
+    def __neg__(self):
+        return Vec3(-self.x_, -self.y_, -self.z_)
+
+    def dot(self, other):
+        return self.x_*other.x_ + self.y_*other.y_ + self.z_*other.z_
+
+    def cross(self, other):
+        return Vec3(
+            self.y_*other.z_ - self.z_*other.y_,
+            self.z_*other.x_ - self.x_*other.z_,
+            self.x_*other.y_ - self.y_*other.x_,
+        )
+
+    def magnitude_squared(self):
+        return self.x_*self.x_ + self.y_*self.y_ + self.z_*self.z_
+
+    def magnitude(self):
+        return math.sqrt(self.magnitude_squared())
+
+    def normalize(self):
+        mag = self.magnitude()
+        if mag > 0:
+            self.x_ /= mag
+            self.y_ /= mag
+            self.z_ /= mag
+
+    def distance(self, other):
+        dx = self.x_ - other.x_; dy = self.y_ - other.y_; dz = self.z_ - other.z_
+        return math.sqrt(dx*dx + dy*dy + dz*dz)
+
+    def distance_squared(self, other):
+        dx = self.x_ - other.x_; dy = self.y_ - other.y_; dz = self.z_ - other.z_
+        return dx*dx + dy*dy + dz*dz
+
+    # ── identity / ordering (matching Atom semantics) ─────────────────────
+
+    def __eq__(self, other):  return self is other
+    def __le__(self, other):  return self.natom <= other.natom
+    def __hash__(self):       return id(self)
+
+    def __repr__(self):
+        return f"AtomView({self._idx}: {self.residue}:{self.atom} mol={self.molecule})"
+
+
+class AtomArray:
+    """
+    Struct-of-arrays container for Atom data.
+
+    Grows dynamically via append(); call finalize() to trim arrays to their
+    true size before running vectorised operations.
+
+    Iterating or indexing always returns the *same cached AtomView* object for
+    a given index, preserving Python identity so that "atom1 is atom2" checks
+    inside the surface-generation algorithm remain correct.
+    """
+
+    _INITIAL_CAP = 256
+    _FLOAT_FIELDS = ('x', 'y', 'z', 'radius', 'density')
+    _INT8_FIELDS  = ('molecule', 'atten', 'access')
+    _INT32_FIELDS = ('natom', 'nresidue')
+
+    def __init__(self):
+        cap = self._INITIAL_CAP
+        self._n   = 0
+        self._cap = cap
+
+        for f in self._FLOAT_FIELDS:
+            setattr(self, f, np.zeros(cap, dtype=np.float64))
+        for f in self._INT8_FIELDS:
+            setattr(self, f, np.zeros(cap, dtype=np.int8))
+        for f in self._INT32_FIELDS:
+            setattr(self, f, np.zeros(cap, dtype=np.int32))
+
+        self.atom_name    = [''] * cap
+        self.residue_name = [''] * cap
+
+        self._views: dict = {}   # index → AtomView cache
+
+    def _grow(self):
+        new_cap = self._cap * 2
+        for f in self._FLOAT_FIELDS + self._INT8_FIELDS + self._INT32_FIELDS:
+            old = getattr(self, f)
+            new = np.zeros(new_cap, dtype=old.dtype)
+            new[:self._n] = old[:self._n]
+            setattr(self, f, new)
+        self.atom_name    = self.atom_name    + [''] * self._cap
+        self.residue_name = self.residue_name + [''] * self._cap
+        self._cap = new_cap
+
+    def append(self, atom):
+        """Copy data from an Atom (or AtomView) into the array; return a cached AtomView."""
+        if self._n >= self._cap:
+            self._grow()
+        i = self._n
+        self.x[i]           = atom.x_
+        self.y[i]           = atom.y_
+        self.z[i]           = atom.z_
+        self.radius[i]      = atom.radius
+        self.density[i]     = atom.density
+        self.natom[i]       = atom.natom
+        self.nresidue[i]    = atom.nresidue
+        self.molecule[i]    = atom.molecule
+        self.atten[i]       = atom.atten
+        self.access[i]      = atom.access
+        self.atom_name[i]   = atom.atom
+        self.residue_name[i]= atom.residue
+        self._n += 1
+        view = AtomView(self, i)
+        self._views[i] = view
+        return view
+
+    def __len__(self):   return self._n
+    def __bool__(self):  return self._n > 0
+
+    def __getitem__(self, idx):
+        if idx < 0:
+            idx = self._n + idx
+        if idx not in self._views:
+            self._views[idx] = AtomView(self, idx)
+        return self._views[idx]
+
+    def __iter__(self):
+        for i in range(self._n):
+            yield self[i]
+
+    def finalize(self):
+        """Trim all arrays to [0:n].  Call once after all appends are done."""
+        for f in self._FLOAT_FIELDS + self._INT8_FIELDS + self._INT32_FIELDS:
+            setattr(self, f, getattr(self, f)[:self._n].copy())
+        self.atom_name    = self.atom_name[:self._n]
+        self.residue_name = self.residue_name[:self._n]
+
+
+class DotArray:
+    """
+    Struct-of-arrays container for DOT data.
+
+    No view class: the caller writes individual field values via append() and
+    reads via the numpy arrays directly (enabling vectorised operations).
+    """
+
+    _INITIAL_CAP = 4096
+
+    def __init__(self):
+        cap = self._INITIAL_CAP
+        self._n   = 0
+        self._cap = cap
+
+        for f in ('coor_x', 'coor_y', 'coor_z',
+                  'outnml_x', 'outnml_y', 'outnml_z', 'area'):
+            setattr(self, f, np.zeros(cap, dtype=np.float64))
+        for f in ('buried', 'type_'):
+            setattr(self, f, np.zeros(cap, dtype=np.int8))
+        self.atom_idx = np.zeros(cap, dtype=np.int32)
+
+    def _grow(self):
+        new_cap = self._cap * 2
+        for f in ('coor_x', 'coor_y', 'coor_z',
+                  'outnml_x', 'outnml_y', 'outnml_z', 'area',
+                  'buried', 'type_', 'atom_idx'):
+            old = getattr(self, f)
+            new = np.zeros(new_cap, dtype=old.dtype)
+            new[:self._n] = old[:self._n]
+            setattr(self, f, new)
+        self._cap = new_cap
+
+    def append(self, coor_x, coor_y, coor_z,
+               outnml_x, outnml_y, outnml_z,
+               area, buried, type_, atom_idx):
+        if self._n >= self._cap:
+            self._grow()
+        i = self._n
+        self.coor_x[i]   = coor_x;  self.coor_y[i]   = coor_y;  self.coor_z[i]   = coor_z
+        self.outnml_x[i] = outnml_x; self.outnml_y[i] = outnml_y; self.outnml_z[i] = outnml_z
+        self.area[i]     = area
+        self.buried[i]   = buried
+        self.type_[i]    = type_
+        self.atom_idx[i] = atom_idx
+        self._n += 1
+
+    def __len__(self):   return self._n
+    def __bool__(self):  return self._n > 0
+
+    def finalize(self):
+        for f in ('coor_x', 'coor_y', 'coor_z',
+                  'outnml_x', 'outnml_y', 'outnml_z', 'area',
+                  'buried', 'type_', 'atom_idx'):
+            setattr(self, f, getattr(self, f)[:self._n].copy())
+
+
+class ProbeView:
+    """Proxy to a single row in a ProbeArray."""
+
+    def __init__(self, arr, atom_arr, idx):
+        object.__setattr__(self, '_arr',      arr)
+        object.__setattr__(self, '_atom_arr', atom_arr)
+        object.__setattr__(self, '_idx',      idx)
+
+    @property
+    def height(self):
+        return float(self._arr.height[self._idx])
+
+    @property
+    def point(self):
+        i = self._idx
+        return Vec3(float(self._arr.point_x[i]),
+                    float(self._arr.point_y[i]),
+                    float(self._arr.point_z[i]))
+
+    @property
+    def alt(self):
+        i = self._idx
+        return Vec3(float(self._arr.alt_x[i]),
+                    float(self._arr.alt_y[i]),
+                    float(self._arr.alt_z[i]))
+
+    @property
+    def pAtoms(self):
+        i = self._idx
+        return [self._atom_arr[int(self._arr.atom_idx_0[i])],
+                self._atom_arr[int(self._arr.atom_idx_1[i])],
+                self._atom_arr[int(self._arr.atom_idx_2[i])]]
+
+    def __eq__(self, other): return self is other
+    def __hash__(self):      return id(self)
+
+
+class ProbeArray:
+    """
+    Struct-of-arrays container for PROBE data.
+
+    Like AtomArray, indexing returns cached ProbeView objects so that
+    "probe is lprobe" identity comparisons in generate_concave_surface work.
+    """
+
+    _INITIAL_CAP = 1024
+
+    def __init__(self, atom_arr):
+        cap = self._INITIAL_CAP
+        self._n        = 0
+        self._cap      = cap
+        self._atom_arr = atom_arr
+
+        for f in ('height',
+                  'point_x', 'point_y', 'point_z',
+                  'alt_x',   'alt_y',   'alt_z'):
+            setattr(self, f, np.zeros(cap, dtype=np.float64))
+        for f in ('atom_idx_0', 'atom_idx_1', 'atom_idx_2'):
+            setattr(self, f, np.zeros(cap, dtype=np.int32))
+
+        self._views: dict = {}
+
+    def _grow(self):
+        new_cap = self._cap * 2
+        for f in ('height',
+                  'point_x', 'point_y', 'point_z',
+                  'alt_x',   'alt_y',   'alt_z',
+                  'atom_idx_0', 'atom_idx_1', 'atom_idx_2'):
+            old = getattr(self, f)
+            new = np.zeros(new_cap, dtype=old.dtype)
+            new[:self._n] = old[:self._n]
+            setattr(self, f, new)
+        self._cap = new_cap
+
+    def append(self, atom_idx_0, atom_idx_1, atom_idx_2, height, point, alt):
+        """point and alt are Vec3 (or anything with .x_, .y_, .z_)."""
+        if self._n >= self._cap:
+            self._grow()
+        i = self._n
+        self.atom_idx_0[i] = atom_idx_0
+        self.atom_idx_1[i] = atom_idx_1
+        self.atom_idx_2[i] = atom_idx_2
+        self.height[i]     = height
+        self.point_x[i]    = point.x_; self.point_y[i] = point.y_; self.point_z[i] = point.z_
+        self.alt_x[i]      = alt.x_;   self.alt_y[i]   = alt.y_;   self.alt_z[i]   = alt.z_
+        self._n += 1
+        view = ProbeView(self, self._atom_arr, i)
+        self._views[i] = view
+        return view
+
+    def __len__(self):   return self._n
+    def __bool__(self):  return self._n > 0
+
+    def __getitem__(self, idx):
+        if idx not in self._views:
+            self._views[idx] = ProbeView(self, self._atom_arr, idx)
+        return self._views[idx]
+
+    def __iter__(self):
+        for i in range(self._n):
+            yield self[i]
+
+    def finalize(self):
+        for f in ('height',
+                  'point_x', 'point_y', 'point_z',
+                  'alt_x',   'alt_y',   'alt_z',
+                  'atom_idx_0', 'atom_idx_1', 'atom_idx_2'):
+            setattr(self, f, getattr(self, f)[:self._n].copy())
+
+
 ATTEN_BLOCKER = 1
 ATTEN_2 = 2
 ATTEN_BURIED_FLAGGED = 5
@@ -184,13 +608,13 @@ class MolecularSurfaceCalculator:
 
     def reset(self):
         self.run = type("Run", (), {})()
-        self.run.radmax = 0.0
-        self.run.results = RESULTS()
-        self.run.atoms = []
-        self.run.dots = [[], []]
-        self.run.trimmed_dots = [[], []]
-        self.run.probes = []
-        self.run.prevp = Vec3()
+        self.run.radmax     = 0.0
+        self.run.results    = RESULTS()
+        self.run.atoms      = AtomArray()
+        self.run.dots       = [DotArray(), DotArray()]
+        self.run.trimmed_dots = [DotArray(), DotArray()]
+        self.run.probes     = ProbeArray(self.run.atoms)
+        self.run.prevp      = Vec3()
         self.run.prevburied = 0
 
 
@@ -228,11 +652,19 @@ class MolecularSurfaceCalculator:
         self.run.results.valid = 0
         assert len(self.run.atoms) > 0
 
+        # Trim atom arrays to true size before vectorised attention assignment
+        self.run.atoms.finalize()
+
         self.assign_attention_numbers(self.run.atoms)
 
         self.generate_molecular_surfaces()
 
-        cms_return = self.calc_contact_molecular_surface( self.run.dots[0], self.run.dots[1] )
+        # Trim dot / probe arrays after surface generation
+        self.run.dots[0].finalize()
+        self.run.dots[1].finalize()
+        self.run.probes.finalize()
+
+        cms_return = self.calc_contact_molecular_surface(self.run.dots[0], self.run.dots[1])
 
         return cms_return
 
@@ -344,12 +776,12 @@ class MolecularSurfaceCalculator:
             self.assign_atom_radius(atom)
 
         if atom.radius > 0:
-            atom.density = self.settings.density
+            atom.density  = self.settings.density
             atom.molecule = 1 if molecule == 1 else 0
-            atom.natom = len(self.run.atoms) + 1
-            atom.access = 0
+            atom.natom    = len(self.run.atoms) + 1
+            atom.access   = 0
 
-            self.run.atoms.append(atom)
+            self.run.atoms.append(atom)  # copies into AtomArray, returns AtomView (unused here)
             self.run.results.surface[atom.molecule].nAtoms += 1
             self.run.results.nAtoms += 1
 
@@ -413,67 +845,81 @@ class MolecularSurfaceCalculator:
 
         return 1
 
-    def calc_contact_molecular_surface(self, my_dots, their_dots):
+    def calc_contact_molecular_surface(self, dots0, dots1):
+        """
+        Compute the contact molecular surface (vectorised).
 
-        if len(my_dots) == 0:
-            return 0
+        Replaces the O(K²) Python nested loop with a single cdist call.
+        For each buried dot in molecule 0 the nearest buried dot in molecule 1
+        is found in one shot; the weighted area sum is then a numpy reduction.
+        """
+        if len(dots0) == 0:
+            return 0.0
 
-        buried_their_dots = []
-        for dot in their_dots:
-            if dot.buried:
-                buried_their_dots.append(dot)
+        buried0 = dots0.buried.astype(bool)
+        buried1 = dots1.buried.astype(bool)
 
-        areas = np.zeros(len(my_dots))
-        for idot, dot in enumerate(my_dots):
-            if not dot.buried:
-                continue
-            neighbor = self.calc_neighbor_distance_find_closest_neighbor(dot, buried_their_dots)
-            if not neighbor:
-                continue
-            distmin = neighbor.coor.distance_squared(dot.coor)
-            areas[idot] = dot.area * np.exp( -distmin * self.settings.weight )
+        if not buried0.any() or not buried1.any():
+            return 0.0
 
-        return areas.sum()
+        xyz0_b  = np.column_stack([dots0.coor_x[buried0],
+                                   dots0.coor_y[buried0],
+                                   dots0.coor_z[buried0]])   # (K0, 3)
+        xyz1_b  = np.column_stack([dots1.coor_x[buried1],
+                                   dots1.coor_y[buried1],
+                                   dots1.coor_z[buried1]])   # (K1, 3)
+        area0_b = dots0.area[buried0]                        # (K0,)
 
-    def calc_neighbor_distance_find_closest_neighbor(self, dot1, their_dots):
-        distmin = 9999999
-        neighbor = None
-        for dot2 in their_dots:
-            if not dot2.buried:
-                continue
-            d = dot2.coor.distance_squared(dot1.coor)
-            if d < distmin:
-                distmin = d
-                neighbor = dot2
+        dist_sq      = cdist(xyz0_b, xyz1_b, metric='sqeuclidean')  # (K0, K1)
+        min_dist_sq  = dist_sq.min(axis=1)                           # (K0,)
 
-        return neighbor
+        return float((area0_b * np.exp(-min_dist_sq * self.settings.weight)).sum())
 
 
     def assign_attention_numbers(self, atoms, all_atoms=False):
         """
-        Assign default attention values to all atoms.
+        Assign attention values to all atoms (vectorised).
+
+        Replaces the O(N²) Python double-loop with a single scipy cdist call
+        to compute all inter-molecule pairwise distances at once.
         """
+        n   = len(atoms)
+        mol = atoms.molecule[:n]
 
         if all_atoms:
-            for atom in atoms:
-                atom.atten = ATTEN_BURIED_FLAGGED
-                self.run.results.surface[atom.molecule].nBuriedAtoms += 1
-        else:
-            for atom1 in atoms:
-                dist_min = 99999.0
-                for atom2 in atoms:
-                    if atom1.molecule == atom2.molecule:
-                        continue
-                    r = atom1.distance(atom2)
-                    if r < dist_min:
-                        dist_min = r
+            atoms.atten[:n] = ATTEN_BURIED_FLAGGED
+            for m in range(2):
+                self.run.results.surface[m].nBuriedAtoms += int((mol == m).sum())
+            return 1
 
-                if dist_min >= self.settings.sep:
-                    atom1.atten = ATTEN_BLOCKER
-                    self.run.results.surface[atom1.molecule].nBlockedAtoms += 1
-                else:
-                    atom1.atten = ATTEN_BURIED_FLAGGED
-                    self.run.results.surface[atom1.molecule].nBuriedAtoms += 1
+        xyz    = np.column_stack([atoms.x[:n], atoms.y[:n], atoms.z[:n]])
+        mask0  = mol == 0
+        mask1  = mol == 1
+        xyz0   = xyz[mask0]    # (N0, 3)
+        xyz1   = xyz[mask1]    # (N1, 3)
+
+        if len(xyz0) > 0 and len(xyz1) > 0:
+            d      = cdist(xyz0, xyz1)   # (N0, N1)
+            min0   = d.min(axis=1)       # min distance for each mol-0 atom
+            min1   = d.min(axis=0)       # min distance for each mol-1 atom
+        else:
+            min0 = np.full(mask0.sum(), 99999.0)
+            min1 = np.full(mask1.sum(), 99999.0)
+
+        idx0      = np.where(mask0)[0]
+        idx1      = np.where(mask1)[0]
+        blocker0  = min0 >= self.settings.sep
+        blocker1  = min1 >= self.settings.sep
+
+        atoms.atten[idx0[blocker0]]  = ATTEN_BLOCKER
+        atoms.atten[idx0[~blocker0]] = ATTEN_BURIED_FLAGGED
+        atoms.atten[idx1[blocker1]]  = ATTEN_BLOCKER
+        atoms.atten[idx1[~blocker1]] = ATTEN_BURIED_FLAGGED
+
+        self.run.results.surface[0].nBlockedAtoms += int(blocker0.sum())
+        self.run.results.surface[0].nBuriedAtoms  += int((~blocker0).sum())
+        self.run.results.surface[1].nBlockedAtoms += int(blocker1.sum())
+        self.run.results.surface[1].nBuriedAtoms  += int((~blocker1).sum())
 
         return 1
 
@@ -721,18 +1167,15 @@ class MolecularSurfaceCalculator:
                 if self.check_atom_collision2(pijk, atom2, atom3, neighbors):
                     continue
 
-                probe = PROBE()
-
                 if isign > 0:
-                    probe.pAtoms = [atom1, atom2, atom3]
+                    a0, a1, a2 = atom1, atom2, atom3
                 else:
-                    probe.pAtoms = [atom2, atom1, atom3]
+                    a0, a1, a2 = atom2, atom1, atom3
 
-                probe.height = hijk
-                probe.point = pijk
-                probe.alt = uijk * isign
-
-                self.run.probes.append(probe)
+                self.run.probes.append(
+                    a0._idx, a1._idx, a2._idx,
+                    hijk, pijk, uijk * isign,
+                )
 
                 atom1.access = 1
                 atom2.access = 1
@@ -1151,39 +1594,35 @@ class MolecularSurfaceCalculator:
         pcen,
         atom
     ):
-
-        dot = DOT()
-        dot.coor = coor
-        dot.outnml = Vec3()
-        dot.area = area
-        dot.buried = 0
-        dot.type = type_
-        dot.atom = atom
-
         pradius = self.settings.rp
 
         # outward normal
         if pradius <= 0:
-            dot.outnml = coor - atom
+            outnml = coor - atom   # Vec3 - AtomView → Vec3
         else:
-            dot.outnml = (pcen - coor) / pradius
+            outnml = (pcen - coor) / pradius
 
         # buried determination
         if pcen.distance_squared(self.run.prevp) <= 0.0:
-            dot.buried = self.run.prevburied
+            buried = self.run.prevburied
         else:
-            dot.buried = 0
+            buried = 0
             for neighbor in atom.buried:
                 erl = neighbor.radius + pradius
                 d = pcen.distance_squared(neighbor)
                 if d <= erl * erl:
-                    dot.buried = 1
+                    buried = 1
                     break
 
-            self.run.prevp = pcen
-            self.run.prevburied = dot.buried
+            self.run.prevp      = pcen
+            self.run.prevburied = buried
 
-        self.run.dots[molecule].append(dot)
+        self.run.dots[molecule].append(
+            coor.x_,    coor.y_,    coor.z_,
+            outnml.x_,  outnml.y_,  outnml.z_,
+            area, buried, type_,
+            atom._idx,   # AtomView carries its index into AtomArray
+        )
 
 
     def distance_point_to_line(self, cen, axis, pnt):
@@ -1288,21 +1727,13 @@ if __name__ == '__main__':
 
 
 
-    dots0 = []
-    for dot in calc.run.dots[0]:
-        dots0.append(np.array([dot.coor.x_, dot.coor.y_, dot.coor.z_]))
+    d0    = calc.run.dots[0]
+    dots0 = np.column_stack([d0.coor_x, d0.coor_y, d0.coor_z])
 
-    dots0 = np.array(dots0)
+    d1    = calc.run.dots[1]
+    dots1 = np.column_stack([d1.coor_x, d1.coor_y, d1.coor_z])
 
-    dots1 = []
-    for dot in calc.run.dots[1]:
-        dots1.append(np.array([dot.coor.x_, dot.coor.y_, dot.coor.z_]))
-    dots1 = np.array(dots1)
-
-
-    probes = []
-    for probe in calc.run.probes:
-        probes.append(np.array([probe.point.x_, probe.point.y_, probe.point.z_]))
-    probes = np.array(probes)
+    pr    = calc.run.probes
+    probes = np.column_stack([pr.point_x, pr.point_y, pr.point_z]) if len(pr) else np.empty((0, 3))
 
 

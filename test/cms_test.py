@@ -39,8 +39,9 @@ class TestCalculatorRun:
     Serialisable snapshot of all self.run variables from a
     MolecularSurfaceCalculator, ready for pickle round-trips.
 
-    Complex object references (Atom.neighbors, DOT.atom, etc.) are resolved
-    to integer indices so the snapshot has no circular references.
+    Because run.atoms / run.dots / run.probes are SoA containers backed by
+    numpy arrays, this class reads those arrays directly — no object traversal
+    or id-to-index mapping needed.
     """
 
     def __init__(self, calc, cms_value):
@@ -54,15 +55,15 @@ class TestCalculatorRun:
         # ── results ───────────────────────────────────────────────────────
         r = run.results
         self.results = {
-            'sc':           r.sc,
-            'area':         r.area,
-            'distance':     r.distance,
-            'perimeter':    r.perimeter,
-            'nAtoms':       r.nAtoms,
-            'valid':        r.valid,
-            'dots_convex':  r.dots.convex,
-            'dots_toroidal':r.dots.toroidal,
-            'dots_concave': r.dots.concave,
+            'sc':            r.sc,
+            'area':          r.area,
+            'distance':      r.distance,
+            'perimeter':     r.perimeter,
+            'nAtoms':        r.nAtoms,
+            'valid':         r.valid,
+            'dots_convex':   r.dots.convex,
+            'dots_toroidal': r.dots.toroidal,
+            'dots_concave':  r.dots.concave,
         }
         for i, surf in enumerate(r.surface):
             p = f'surface_{i}'
@@ -82,69 +83,86 @@ class TestCalculatorRun:
             })
 
         # ── atoms ─────────────────────────────────────────────────────────
-        # Build id-to-index map first so dots/probes can reference atoms by index
-        atom_to_idx = {id(a): i for i, a in enumerate(run.atoms)}
-
-        self.atoms = []
-        for atom in run.atoms:
-            self.atoms.append({
-                'natom':       atom.natom,
-                'nresidue':    atom.nresidue,
-                'atom':        atom.atom,
-                'residue':     atom.residue,
-                'molecule':    atom.molecule,
-                'radius':      atom.radius,
-                'density':     atom.density,
-                'atten':       atom.atten,
-                'access':      atom.access,
-                'x':           atom.x_,
-                'y':           atom.y_,
-                'z':           atom.z_,
-                'n_neighbors': len(atom.neighbors),
-                'n_buried':    len(atom.buried),
-            })
+        # Read directly from AtomArray numpy arrays; per-atom neighbor / buried
+        # lists are on the cached AtomView objects.
+        a = run.atoms
+        n = len(a)
+        self.atoms = [
+            {
+                'natom':       int(a.natom[i]),
+                'nresidue':    int(a.nresidue[i]),
+                'atom':        a.atom_name[i],
+                'residue':     a.residue_name[i],
+                'molecule':    int(a.molecule[i]),
+                'radius':      float(a.radius[i]),
+                'density':     float(a.density[i]),
+                'atten':       int(a.atten[i]),
+                'access':      int(a.access[i]),
+                'x':           float(a.x[i]),
+                'y':           float(a.y[i]),
+                'z':           float(a.z[i]),
+                'n_neighbors': len(a[i].neighbors),
+                'n_buried':    len(a[i].buried),
+            }
+            for i in range(n)
+        ]
 
         # ── dots ──────────────────────────────────────────────────────────
+        # DotArray stores atom_idx directly; no id() lookup needed.
         self.dots = [[], []]
         for mol in range(2):
-            for dot in run.dots[mol]:
-                self.dots[mol].append({
-                    'coor_x':   dot.coor.x_,
-                    'coor_y':   dot.coor.y_,
-                    'coor_z':   dot.coor.z_,
-                    'area':     dot.area,
-                    'buried':   dot.buried,
-                    'type':     dot.type,
-                    'atom_idx': atom_to_idx.get(id(dot.atom), -1),
-                })
+            d = run.dots[mol]
+            nd = len(d)
+            self.dots[mol] = [
+                {
+                    'coor_x':   float(d.coor_x[i]),
+                    'coor_y':   float(d.coor_y[i]),
+                    'coor_z':   float(d.coor_z[i]),
+                    'area':     float(d.area[i]),
+                    'buried':   int(d.buried[i]),
+                    'type':     int(d.type_[i]),
+                    'atom_idx': int(d.atom_idx[i]),
+                }
+                for i in range(nd)
+            ]
 
         # ── trimmed_dots ──────────────────────────────────────────────────
         self.trimmed_dots = [[], []]
         for mol in range(2):
-            for dot in run.trimmed_dots[mol]:
-                self.trimmed_dots[mol].append({
-                    'coor_x':   dot.coor.x_,
-                    'coor_y':   dot.coor.y_,
-                    'coor_z':   dot.coor.z_,
-                    'area':     dot.area,
-                    'buried':   dot.buried,
-                    'type':     dot.type,
-                    'atom_idx': atom_to_idx.get(id(dot.atom), -1),
-                })
+            d = run.trimmed_dots[mol]
+            nd = len(d)
+            self.trimmed_dots[mol] = [
+                {
+                    'coor_x':   float(d.coor_x[i]),
+                    'coor_y':   float(d.coor_y[i]),
+                    'coor_z':   float(d.coor_z[i]),
+                    'area':     float(d.area[i]),
+                    'buried':   int(d.buried[i]),
+                    'type':     int(d.type_[i]),
+                    'atom_idx': int(d.atom_idx[i]),
+                }
+                for i in range(nd)
+            ]
 
         # ── probes ────────────────────────────────────────────────────────
-        self.probes = []
-        for probe in run.probes:
-            self.probes.append({
-                'atom_indices': [atom_to_idx.get(id(a), -1) for a in probe.pAtoms],
-                'height':  probe.height,
-                'point_x': probe.point.x_,
-                'point_y': probe.point.y_,
-                'point_z': probe.point.z_,
-                'alt_x':   probe.alt.x_,
-                'alt_y':   probe.alt.y_,
-                'alt_z':   probe.alt.z_,
-            })
+        # ProbeArray stores atom indices directly in atom_idx_{0,1,2}.
+        p  = run.probes
+        np_ = len(p)
+        self.probes = [
+            {
+                'atom_indices': [int(p.atom_idx_0[i]),
+                                 int(p.atom_idx_1[i]),
+                                 int(p.atom_idx_2[i])],
+                'height':  float(p.height[i]),
+                'point_x': float(p.point_x[i]),
+                'point_y': float(p.point_y[i]),
+                'point_z': float(p.point_z[i]),
+                'alt_x':   float(p.alt_x[i]),
+                'alt_y':   float(p.alt_y[i]),
+                'alt_z':   float(p.alt_z[i]),
+            }
+            for i in range(np_)
+        ]
 
 
 # ── Comparison helpers ────────────────────────────────────────────────────────
