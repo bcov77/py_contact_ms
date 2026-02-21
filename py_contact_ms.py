@@ -710,7 +710,8 @@ class MolecularSurfaceCalculator:
         self.run.probes     = ProbeArray(self.run.atoms)
         self.run.prevp      = Vec3()
         self.run.prevburied = 0
-        self.run.neighborArray = None
+        self.run.neighbor_array = None
+        self.run.buried_array = None
 
 
     def calc(self, pose, jump_id=1):
@@ -1032,6 +1033,21 @@ class MolecularSurfaceCalculator:
             self.run.neighbor_array.radius[iatom, :n] = [x.radius for x in atom.neighbors]
             self.run.neighbor_array.natom[iatom, :n] = [x.natom for x in atom.neighbors]
             self.run.neighbor_array.nneighbors[iatom] = n
+
+
+        max_burieds = 0
+        for atom in self.run.atoms:
+            max_burieds = max(max_burieds, len(atom.buried))
+
+        self.run.buried_array = SimpleNeighborArray(len(self.run.atoms), max_burieds)
+        for iatom, atom in enumerate(self.run.atoms):
+            n = len(atom.buried)
+            self.run.buried_array.xyz[iatom, :n, 0] = [x.x_ for x in atom.buried]
+            self.run.buried_array.xyz[iatom, :n, 1] = [x.y_ for x in atom.buried]
+            self.run.buried_array.xyz[iatom, :n, 2] = [x.z_ for x in atom.buried]
+            self.run.buried_array.radius[iatom, :n] = [x.radius for x in atom.buried]
+            self.run.buried_array.natom[iatom, :n] = [x.natom for x in atom.buried]
+            self.run.buried_array.nneighbors[iatom] = n
 
     def calc_dots_for_all_atoms(self, _atoms_unused):
         """
@@ -1790,19 +1806,12 @@ class MolecularSurfaceCalculator:
             outnml = (pcen - coor) / pradius
 
         # buried determination
-        if pcen.distance_squared(self.run.prevp) <= 0.0:
-            buried = self.run.prevburied
-        else:
-            buried = 0
-            for neighbor in atom.buried:
-                erl = neighbor.radius + pradius
-                d = pcen.distance_squared(neighbor)
-                if d <= erl * erl:
-                    buried = 1
-                    break
+        d2 = np.square(self.run.buried_array.xyz[atom.natom] - pcen.to_numpy()).sum(axis=-1)
+        buried = (d2 <= (self.run.buried_array.radius[atom.natom] + pradius)**2).any()
 
-            self.run.prevp      = pcen
-            self.run.prevburied = buried
+        # These are just here for the regression test
+        self.run.prevp      = pcen
+        self.run.prevburied = buried
 
         self.run.dots[molecule].append(
             coor.x_,    coor.y_,    coor.z_,
