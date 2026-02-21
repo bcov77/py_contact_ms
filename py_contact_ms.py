@@ -272,6 +272,9 @@ class AtomView:
         if value is None: return self.z_
         self.z_ = float(value)
 
+    def to_numpy(self):
+        return np.array([self.x_, self.y_, self.z_])
+
     def __add__(self, other):
         return Vec3(self.x_ + other.x_, self.y_ + other.y_, self.z_ + other.z_)
 
@@ -1326,32 +1329,30 @@ class MolecularSurfaceCalculator:
             # ps0 = self.sub_cir(cen, rad, north, atom1.density, points0)
             ps, points = self.vec_sub_cir(cen.to_numpy()[None], np.array([rad]), north.to_numpy()[None], np.array([atom1.density]))
             points = points[0]
-            points = [Vec3.from_xyz(xyz) for xyz in points[~np.isnan(points[:,0])]]
+            points = points[~np.isnan(points[:,0])]
+            ps = ps[0]
 
-            if not points:
+            if len(points) == 0:
                 continue
 
             area = ps * cs
 
-            for point in points:
+            pcen = atom1.to_numpy() + ((points - atom1.to_numpy()) * (eri / ri))
+            collisions = self.vec_check_point_collision(pcen[...,None,:], self.run.neighbor_array.xyz[atom1.natom], self.run.neighbor_array.radius[atom1.natom])
 
-                pcen = atom1 + ((point - atom1) * (eri/ri))
-
-                # if self.check_point_collision(pcen, neighbors):
-                #     continue
-                if self.check_point_collision_array(pcen, self.run.neighbor_array.xyz[atom1.natom], self.run.neighbor_array.radius[atom1.natom]):
-                    continue
+            for point, pcen in zip(points[~collisions], pcen[~collisions]):
 
                 self.run.results.dots.convex += 1
 
                 self.add_dot(
                     atom1.molecule,
                     1,
-                    point,
+                    Vec3.from_xyz(point),
                     area,
-                    pcen,
+                    Vec3.from_xyz(pcen),
                     atom1
                 )
+
 
         return 1
 
@@ -1371,7 +1372,16 @@ class MolecularSurfaceCalculator:
         dists = np.linalg.norm(xyzs - pcen_np, axis=-1)
         collision = (dists <= (rads + self.settings.rp)) & ~np.isnan(rads) 
 
-        return collision[1:].any()
+        return collision[...,1:].any()
+
+
+    def vec_check_point_collision(self, pcen, xyzs, rads):
+
+        # skip first neighbor (matches C++ begin()+1)
+        dists = np.linalg.norm(xyzs - pcen, axis=-1)
+        collision = (dists <= (rads + self.settings.rp)) & ~np.isnan(rads) 
+
+        return collision[...,1:].any(axis=-1)
 
 
 
