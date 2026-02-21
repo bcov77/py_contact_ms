@@ -1963,6 +1963,10 @@ class MolecularSurfaceCalculator:
 
         dt1 = v.dot(x)
         dt2 = v.dot(y)
+        
+        # bcov addition
+        if np.isclose(dt1, 0) and np.isclose(dt2, 0):
+            return 0
 
         angle = math.atan2(dt2, dt1)
 
