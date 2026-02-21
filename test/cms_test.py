@@ -169,7 +169,7 @@ class TestCalculatorRun:
 
 def _rel_diff(a, b):
     denom = max(abs(a), abs(b), 1e-10)
-    return abs(a - b) / denom
+    return abs(float(a) - float(b)) / denom
 
 
 def _check_scalar(name, cur, gold, tol, out):

@@ -1491,26 +1491,6 @@ class MolecularSurfaceCalculator:
 
         return 1
 
-
-    def check_point_collision(self, pcen, atoms):
-
-        # skip first neighbor (matches C++ begin()+1)
-        for neighbor in atoms[1:]:
-            if pcen.distance(neighbor) <= (neighbor.radius + self.settings.rp):
-                return 1
-
-        return 0
-
-    def check_point_collision_array(self, pcen, xyzs, rads):
-
-        # skip first neighbor (matches C++ begin()+1)
-        pcen_np = pcen.to_numpy()
-        dists = np.linalg.norm(xyzs - pcen_np, axis=-1)
-        collision = (dists <= (rads + self.settings.rp)) & ~np.isnan(rads) 
-
-        return collision[...,1:].any()
-
-
     def vec_check_point_collision(self, pcen, xyzs, rads):
 
         # skip first neighbor (matches C++ begin()+1)
@@ -1535,6 +1515,10 @@ class MolecularSurfaceCalculator:
 
         neighbors = atom1.neighbors
 
+        neigh_xyz = self.run.neighbor_array.xyz[atom1.natom]
+        neigh_rad = self.run.neighbor_array.radius[atom1.natom]
+        neigh_natom = self.run.neighbor_array.natom[atom1.natom]
+
         density = (atom1.density + atom2.density) / 2.0
 
         eri = atom1.radius + self.settings.rp
@@ -1550,22 +1534,23 @@ class MolecularSurfaceCalculator:
         e = rs / rij
         edens = e * e * density
 
-        subs = []
-        ts = self.sub_cir(tij, rij, uij, edens, subs)
+        subs0 = []
+        ts0 = self.sub_cir(tij, rij, uij, edens, subs0)
+
+        ts, subs = self.vec_sub_cir(tij.to_numpy()[None], np.array([rij]), uij.to_numpy()[None], np.array([edens]))
+        ts = ts[0]
+        subs = subs[0]
+        subs = [Vec3.from_xyz(xyz) for xyz in subs[~np.isnan(subs[:,0])]]
+
+
         if not subs:
             return 0
 
         for sub in subs:
 
-            # collision check
-            tooclose = False
-            for neighbor in neighbors:
-                if neighbor is atom2:
-                    continue
-                erl = neighbor.radius + self.settings.rp
-                if sub.distance_squared(neighbor) < erl * erl:
-                    tooclose = True
-                    break
+            d2 = np.square(sub.to_numpy() - neigh_xyz).sum(axis=-1)
+            mask = (neigh_natom != atom2.natom) & ~np.isnan(d2)
+            tooclose = (d2 < (neigh_rad + self.settings.rp)**2)[mask].any()
 
             if tooclose:
                 continue
@@ -1612,30 +1597,38 @@ class MolecularSurfaceCalculator:
             # Arc for atom1
             if atom1.atten >= ATTEN_2:
                 points = []
-                ps = self.sub_arc(pij, self.settings.rp, axis,
-                                  density, pi, pqi, points)
+                ps, points = self.vec_sub_arc(pij.to_numpy()[None], np.array([self.settings.rp]), axis.to_numpy()[None],
+                                  np.array([density]), pi.to_numpy()[None], pqi.to_numpy()[None])
+                ps = ps[0]
+                points = points[0]
 
-                for point in points:
-                    area = ps * ts * \
-                           self.distance_point_to_line(tij, uij, point) / rij
+                areas = ps * ts * self.vec_distance_point_to_line(tij.to_numpy()[None], uij.to_numpy()[None], points) / rij
+                mask = ~np.isnan(areas)
+
+                for point, area in zip(points[mask], areas[mask]):
 
                     self.run.results.dots.toroidal += 1
                     self.add_dot(atom1.molecule, 2,
-                                 point, area, pij, atom1)
+                                 Vec3.from_xyz(point), area, pij, atom1)
 
             # Arc for atom2
             if atom2.atten >= ATTEN_2:
-                points = []
-                ps = self.sub_arc(pij, self.settings.rp, axis,
-                                  density, pqj, pj, points)
 
-                for point in points:
-                    area = ps * ts * \
-                           self.distance_point_to_line(tij, uij, point) / rij
+
+                # points = []
+                ps, points = self.vec_sub_arc(pij.to_numpy()[None], np.array([self.settings.rp]), axis.to_numpy()[None],
+                                  np.array([density]), pqj.to_numpy()[None], pj.to_numpy()[None])
+                ps = ps[0]
+                points = points[0]
+
+                areas = ps * ts * self.vec_distance_point_to_line(tij.to_numpy()[None], uij.to_numpy()[None], points) / rij
+                mask = ~np.isnan(areas)
+
+                for point, area in zip(points[mask], areas[mask]):
 
                     self.run.results.dots.toroidal += 1
                     self.add_dot(atom1.molecule, 2,
-                                 point, area, pij, atom2)
+                                 Vec3.from_xyz(point), area, pij, atom2)
 
         return 1
 
@@ -1821,6 +1814,20 @@ class MolecularSurfaceCalculator:
         )
 
 
+
+    def vec_distance_point_to_line(self, cen, axis, pnt):
+
+        vec = pnt - cen
+        dt = (vec * axis).sum(axis=-1) #vec.dot(axis)
+        d2 = np.square(vec).sum(axis=-1) - dt * dt
+
+        return np.where(d2 < 0.0, 0, np.sqrt(d2))
+        # if d2 < 0.0:
+        #     return 0.0
+
+        # return math.sqrt(d2)
+
+
     def distance_point_to_line(self, cen, axis, pnt):
 
         vec = pnt - cen
@@ -1852,6 +1859,8 @@ class MolecularSurfaceCalculator:
 
         angle = np.arctan2(dt2, dt1)
         angle = np.where(angle < 0.0, angle + 2*np.pi, angle)
+
+        angle = np.where(np.isclose(dt1, 0) & np.isclose(dt2, 0), np.nan, angle)
 
         return self.vec_sub_div(cen, rad, x, y, angle, density)
 
@@ -1963,7 +1972,7 @@ class MolecularSurfaceCalculator:
 
         dt1 = v.dot(x)
         dt2 = v.dot(y)
-        
+
         # bcov addition
         if np.isclose(dt1, 0) and np.isclose(dt2, 0):
             return 0
