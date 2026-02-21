@@ -1300,10 +1300,13 @@ class MolecularSurfaceCalculator:
             if north.cross(south).dot(eqvec) <= 0.0:
                 raise RuntimeError("Non-positive frame")
 
-        lats = []
+        lats0 = []
         o = Vec3(0, 0, 0)
 
-        cs = self.sub_arc(o, ri, eqvec, atom1.density, north, south, lats)
+        # cs0 = self.sub_arc(o, ri, eqvec, atom1.density, north, south, lats0)
+        cs, lats = self.vec_sub_arc(o.to_numpy()[None], np.array([ri]), eqvec.to_numpy()[None], np.array([atom1.density]), north.to_numpy()[None], south.to_numpy()[None])
+        lats = lats[0]
+        lats = [Vec3.from_xyz(xyz) for xyz in lats[~np.isnan(lats[:,0])]]
 
         if not lats:
             return 0
@@ -1319,8 +1322,11 @@ class MolecularSurfaceCalculator:
 
             rad = math.sqrt(rad)
 
-            points = []
-            ps = self.sub_cir(cen, rad, north, atom1.density, points)
+            # points0 = []
+            # ps0 = self.sub_cir(cen, rad, north, atom1.density, points0)
+            ps, points = self.vec_sub_cir(cen.to_numpy()[None], np.array([rad]), north.to_numpy()[None], np.array([atom1.density]))
+            points = points[0]
+            points = [Vec3.from_xyz(xyz) for xyz in points[~np.isnan(points[:,0])]]
 
             if not points:
                 continue
@@ -1686,6 +1692,122 @@ class MolecularSurfaceCalculator:
             return 0.0
 
         return math.sqrt(d2)
+
+
+    import numpy as np
+
+    def vec_sub_arc(self, cen, rad, axis, density, x, v):
+        """
+        cen, axis, x, v: (..., 3)
+        rad, density: (...)
+        Returns:
+            ps: (...)
+            points: (..., MAX_SUBDIV, 3)
+        """
+
+        # y = axis × x
+        y = np.cross(axis, x)
+
+        dt1 = np.sum(v * x, axis=-1)
+        dt2 = np.sum(v * y, axis=-1)
+
+        angle = np.arctan2(dt2, dt1)
+        angle = np.where(angle < 0.0, angle + 2*np.pi, angle)
+
+        return self.vec_sub_div(cen, rad, x, y, angle, density)
+
+    def vec_sub_div(self, cen, rad, x, y, angle, density):
+        """
+        cen, x, y: (..., 3)
+        rad, angle, density: (...)
+        
+        Returns:
+            ps: (...)
+            points: (..., MAX_SUBDIV, 3)
+        """
+
+        rad = np.asarray(rad)
+        density = np.asarray(density)
+        angle = np.asarray(angle)
+
+        # Angular spacing
+        delta = 1.0 / (np.sqrt(density) * rad)
+
+        # Shape helpers
+        base_shape = rad.shape
+        full_shape = base_shape + (MAX_SUBDIV,)
+
+        # Generate all candidate subdivision indices
+        i = np.arange(MAX_SUBDIV)
+
+        # a_i = delta*(i + 1/2)
+        a = delta[..., None] * (i + 0.5)
+
+        # Mask where subdivision exceeds angle
+        mask = a <= angle[..., None]
+
+        # cos/sin
+        c = rad[..., None] * np.cos(a)
+        s = rad[..., None] * np.sin(a)
+
+        # Expand vectors
+        cen_exp = cen[..., None, :]
+        x_exp = x[..., None, :]
+        y_exp = y[..., None, :]
+
+        points = cen_exp + x_exp * c[..., None] + y_exp * s[..., None]
+
+        # Apply mask → nan where invalid
+        points = np.where(mask[..., None], points, np.nan)
+
+        # Count valid points
+        counts = np.sum(mask, axis=-1)
+
+        # ps = rad * angle / count
+        ps = np.where(counts > 0, rad * angle / counts, 0.0)
+
+        return ps, points
+
+    def vec_sub_cir(self, cen, rad, axis, density):
+        """
+        cen, axis: (..., 3)
+        rad, density: (...)
+        
+        Returns:
+            ps: (...)
+            points: (..., MAX_SUBDIV, 3)
+        """
+
+        axis = axis / np.linalg.norm(axis, axis=-1, keepdims=True)
+
+        # Build v1
+        v1 = np.stack([
+            axis[...,1]**2 + axis[...,2]**2,
+            axis[...,0]**2 + axis[...,2]**2,
+            axis[...,0]**2 + axis[...,1]**2
+        ], axis=-1)
+
+        v1 = v1 / np.linalg.norm(v1, axis=-1, keepdims=True)
+
+        dt = np.sum(v1 * axis, axis=-1)
+
+        # Replace near-parallel cases
+        replace = np.abs(dt) > 0.99
+        v1 = np.where(replace[..., None],
+                      np.array([1.0, 0.0, 0.0]),
+                      v1)
+
+        v2 = np.cross(axis, v1)
+        v2 = v2 / np.linalg.norm(v2, axis=-1, keepdims=True)
+
+        x = np.cross(axis, v2)
+        x = x / np.linalg.norm(x, axis=-1, keepdims=True)
+
+        y = np.cross(axis, x)
+
+        angle = np.full_like(rad, 2*np.pi)
+
+        return self.vec_sub_div(cen, rad, x, y, angle, density)
 
     def sub_arc(
         self,
