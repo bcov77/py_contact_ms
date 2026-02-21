@@ -583,6 +583,39 @@ class SimpleNeighborArray:
     Store the information needed to work with neighbors
     '''
 
+    _INITIAL_CAP = 256
+
+    def __init__(self, max_neighbors, initial_cap=None):
+        cap = initial_cap or self._INITIAL_CAP
+        self._n   = 0
+        self._cap = cap
+        self._max_neighbors = max_neighbors
+
+        self._refresh(cap)
+
+        self._keys = ['xyz', 'radius', 'neighbors']
+
+    def _refresh(self, cap):
+
+        self.xyz = np.full((cap, max_neighbors, 3), np.nan, dtype=np.float64)
+        self.radius = np.full((cap, max_neighbors), np.nan, dtype=np.float64)
+        self.neighbors = np.zeros((cap,), dtype=np.int32)
+
+    def _grow(self):
+        new_cap = self._cap * 2
+
+        olds = {key:getattr(self, key) for key in self._keys}
+        self._refresh(new_cap)
+
+        for key in self._keys:
+            new = getattr(self, key)
+            new[:self._n] = olds[key][:self._n]
+            setattr(self, key, new)
+        self._cap = new_cap
+
+    def __len__(self):   return self._n
+    def __bool__(self):  return self._n > 0
+
 
 ATTEN_BLOCKER = 1
 ATTEN_2 = 2
@@ -940,14 +973,29 @@ class MolecularSurfaceCalculator:
             if atom.radius > self.run.radmax:
                 self.run.radmax = atom.radius
 
-        # Generate convex surfaces
-        for iatom, atom1 in enumerate(self.run.atoms):
 
+        good_atom = np.zeros(len(self.run.atoms), dtype=bool)
+        for iatom, atom1 in enumerate(self.run.atoms):
             if atom1.atten <= 0:
                 continue
-
-            if not self.find_neighbors_and_buried_atoms(atom1):
+            if not self.find_neighbors_for_atom(atom1):
                 continue
+            atom1.neighbors.sort(key=lambda a: atom1.distance(a))
+            good_atom[iatom] = True
+
+
+        # Generate convex surfaces
+        for iatom, atom1 in enumerate(self.run.atoms):
+            if not good_atom[iatom]:
+                continue
+
+            self.second_loop(atom1)
+
+            if not len(atom1.neighbors):
+                continue
+
+            # if not self.find_neighbors_and_buried_atoms(atom1):
+            #     continue
 
             if not atom1.access:
                 continue
