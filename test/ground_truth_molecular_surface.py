@@ -16,9 +16,9 @@ import npose_util as nu
 pose = pose_from_file(sys.argv[1])
 
 
-calc = core.scoring.sc.MolecularSurfaceCalculator()
+# calc = core.scoring.sc.MolecularSurfaceCalculator()
+calc = core.scoring.sc.ContactMolecularSurfaceCalculator()
 calc.Calc(pose, 1)
-
 
 
 dots0 = []

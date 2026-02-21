@@ -232,7 +232,9 @@ class MolecularSurfaceCalculator:
 
         self.generate_molecular_surfaces()
 
-        return 1
+        cms_return = self.calc_contact_molecular_surface( self.run.dots[0], self.run.dots[1] )
+
+        return cms_return
 
     def generate_molecular_surfaces(self):
 
@@ -411,14 +413,67 @@ class MolecularSurfaceCalculator:
 
         return 1
 
-    def assign_attention_numbers(self, atoms):
+    def calc_contact_molecular_surface(self, my_dots, their_dots):
+
+        if len(my_dots) == 0:
+            return 0
+
+        buried_their_dots = []
+        for dot in their_dots:
+            if dot.buried:
+                buried_their_dots.append(dot)
+
+        areas = np.zeros(len(my_dots))
+        for idot, dot in enumerate(my_dots):
+            if not dot.buried:
+                continue
+            neighbor = self.calc_neighbor_distance_find_closest_neighbor(dot, buried_their_dots)
+            if not neighbor:
+                continue
+            distmin = neighbor.coor.distance_squared(dot.coor)
+            areas[idot] = dot.area * np.exp( -distmin * self.settings.weight )
+
+        return areas.sum()
+
+    def calc_neighbor_distance_find_closest_neighbor(self, dot1, their_dots):
+        distmin = 9999999
+        neighbor = None
+        for dot2 in their_dots:
+            if not dot2.buried:
+                continue
+            d = dot2.coor.distance_squared(dot1.coor)
+            if d < distmin:
+                distmin = d
+                neighbor = dot2
+
+        return neighbor
+
+
+    def assign_attention_numbers(self, atoms, all_atoms=False):
         """
         Assign default attention values to all atoms.
         """
 
-        for atom in atoms:
-            atom.atten = ATTEN_BURIED_FLAGGED
-            self.run.results.surface[atom.molecule].nBuriedAtoms += 1
+        if all_atoms:
+            for atom in atoms:
+                atom.atten = ATTEN_BURIED_FLAGGED
+                self.run.results.surface[atom.molecule].nBuriedAtoms += 1
+        else:
+            for atom1 in atoms:
+                dist_min = 99999.0
+                for atom2 in atoms:
+                    if atom1.molecule == atom2.molecule:
+                        continue
+                    r = atom1.distance(atom2)
+                    if r < dist_min:
+                        dist_min = r
+
+                if dist_min >= self.settings.sep:
+                    atom1.atten = ATTEN_BLOCKER
+                    self.run.results.surface[atom1.molecule].nBlockedAtoms += 1
+                else:
+                    atom1.atten = ATTEN_BURIED_FLAGGED
+                    self.run.results.surface[atom1.molecule].nBuriedAtoms += 1
 
         return 1
 
@@ -1218,34 +1273,36 @@ class MolecularSurfaceCalculator:
 
 
 
+if __name__ == '__main__':
 
-import sys
+    import sys
 
-pdb = sys.argv[1]
+    pdb = sys.argv[1]
 
-pose = pose_from_file(pdb)
+    pose = pose_from_file(pdb)
 
-calc = MolecularSurfaceCalculator()
-calc.calc(pose)
+    calc = MolecularSurfaceCalculator()
+    cms = calc.calc(pose)
 
-
-
-
-dots0 = []
-for dot in calc.run.dots[0]:
-    dots0.append(np.array([dot.coor.x_, dot.coor.y_, dot.coor.z_]))
-
-dots0 = np.array(dots0)
-
-dots1 = []
-for dot in calc.run.dots[1]:
-    dots1.append(np.array([dot.coor.x_, dot.coor.y_, dot.coor.z_]))
-dots1 = np.array(dots1)
+    print(cms)
 
 
-probes = []
-for probe in calc.run.probes:
-    probes.append(np.array([probe.point.x_, probe.point.y_, probe.point.z_]))
-probes = np.array(probes)
+
+    dots0 = []
+    for dot in calc.run.dots[0]:
+        dots0.append(np.array([dot.coor.x_, dot.coor.y_, dot.coor.z_]))
+
+    dots0 = np.array(dots0)
+
+    dots1 = []
+    for dot in calc.run.dots[1]:
+        dots1.append(np.array([dot.coor.x_, dot.coor.y_, dot.coor.z_]))
+    dots1 = np.array(dots1)
+
+
+    probes = []
+    for probe in calc.run.probes:
+        probes.append(np.array([probe.point.x_, probe.point.y_, probe.point.z_]))
+    probes = np.array(probes)
 
 
