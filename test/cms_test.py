@@ -98,9 +98,9 @@ class TestCalculatorRun:
                 'density':     float(a.density[i]),
                 'atten':       int(a.atten[i]),
                 'access':      int(a.access[i]),
-                'x':           float(a.x[i]),
-                'y':           float(a.y[i]),
-                'z':           float(a.z[i]),
+                'x':           float(a.xyz[i,0]),
+                'y':           float(a.xyz[i,1]),
+                'z':           float(a.xyz[i,2]),
                 'n_neighbors': len(a[i].neighbors),
                 'n_buried':    len(a[i].buried),
             }

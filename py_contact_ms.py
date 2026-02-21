@@ -198,19 +198,19 @@ class AtomView:
     # ── numpy-backed scalar properties ────────────────────────────────────
 
     @property
-    def x_(self):            return float(self._arr.x[self._idx])
+    def x_(self):            return float(self._arr.xyz[self._idx,0])
     @x_.setter
-    def x_(self, v):         self._arr.x[self._idx] = v
+    def x_(self, v):         self._arr.xyz[self._idx,0] = v
 
     @property
-    def y_(self):            return float(self._arr.y[self._idx])
+    def y_(self):            return float(self._arr.xyz[self._idx, 1])
     @y_.setter
-    def y_(self, v):         self._arr.y[self._idx] = v
+    def y_(self, v):         self._arr.xyz[self._idx, 1] = v
 
     @property
-    def z_(self):            return float(self._arr.z[self._idx])
+    def z_(self):            return float(self._arr.xyz[self._idx, 2])
     @z_.setter
-    def z_(self, v):         self._arr.z[self._idx] = v
+    def z_(self, v):         self._arr.xyz[self._idx, 2] = v
 
     @property
     def natom(self):         return int(self._arr.natom[self._idx])
@@ -344,7 +344,7 @@ class AtomArray:
     """
 
     _INITIAL_CAP = 256
-    _FLOAT_FIELDS = ('x', 'y', 'z', 'radius', 'density')
+    _FLOAT_FIELDS = ('radius', 'density')
     _INT8_FIELDS  = ('molecule', 'atten', 'access')
     _INT32_FIELDS = ('natom', 'nresidue')
 
@@ -362,6 +362,7 @@ class AtomArray:
 
         self.atom_name    = [''] * cap
         self.residue_name = [''] * cap
+        self.xyz = np.zeros((cap, 3), dtype=np.float64)
 
         self._views: dict = {}   # index → AtomView cache
 
@@ -374,6 +375,9 @@ class AtomArray:
             setattr(self, f, new)
         self.atom_name    = self.atom_name    + [''] * self._cap
         self.residue_name = self.residue_name + [''] * self._cap
+        xyz_old = self.xyz
+        self.xyz = np.zeros((new_cap, 3), dtype=np.float64)
+        self.xyz[:self._n] = xyz_old[:self._n]
         self._cap = new_cap
 
     def append(self, atom):
@@ -381,9 +385,9 @@ class AtomArray:
         if self._n >= self._cap:
             self._grow()
         i = self._n
-        self.x[i]           = atom.x_
-        self.y[i]           = atom.y_
-        self.z[i]           = atom.z_
+        self.xyz[i,0]           = atom.x_
+        self.xyz[i,1]           = atom.y_
+        self.xyz[i,2]           = atom.z_
         self.radius[i]      = atom.radius
         self.density[i]     = atom.density
         self.natom[i]       = atom.natom
@@ -922,7 +926,7 @@ class MolecularSurfaceCalculator:
                 self.run.results.surface[m].nBuriedAtoms += int((mol == m).sum())
             return 1
 
-        xyz    = np.column_stack([atoms.x[:n], atoms.y[:n], atoms.z[:n]])
+        xyz    = atoms.xyz[:n]
         mask0  = mol == 0
         mask1  = mol == 1
         xyz0   = xyz[mask0]    # (N0, 3)
@@ -1238,6 +1242,177 @@ class MolecularSurfaceCalculator:
                 return 1
 
         return 0
+
+    def vec_generate_convex_surface(self, atoms):
+
+        N = atoms.xyz.shape[0]
+
+        north = np.zeros((N,3))
+        north[:] = np.array([0.,0.,1.])
+
+        south = np.zeros((N,3))
+        south[:] = np.array([0.,0.,-1.])
+
+        eqvec = np.zeros((N,3))
+        eqvec[:] = np.array([1.,0.,0.])
+
+        ri  = atoms.radius                  # (N,)
+        eri = atoms.radius + self.settings.rp
+
+        nneigh = self.run.neighbor_array.nneighbors[atoms.natom]  # (N,)
+        has_neigh = nneigh > 0
+
+        if np.any(has_neigh):
+
+            neigh_xyz = self.run.neighbor_array.xyz[atoms.natom][:,0]      # (N,3)
+            neigh_rad = self.run.neighbor_array.radius[atoms.natom][:,0]   # (N,)
+
+            # direction to neighbor
+            north_vec = atoms.xyz - neigh_xyz
+            north_vec /= np.linalg.norm(north_vec, axis=-1, keepdims=True)
+
+            north[has_neigh] = north_vec[has_neigh]
+
+            vtemp = np.stack([
+                north[:,1]**2 + north[:,2]**2,
+                north[:,0]**2 + north[:,2]**2,
+                north[:,0]**2 + north[:,1]**2
+            ], axis=-1)
+
+            vtemp /= np.linalg.norm(vtemp, axis=-1, keepdims=True)
+
+            dt = np.sum(vtemp * north, axis=-1)
+
+            replace = np.abs(dt) > 0.99
+            vtemp[replace] = np.array([1.,0.,0.])
+
+            eq = np.cross(north, vtemp)
+            eq /= np.linalg.norm(eq, axis=-1, keepdims=True)
+
+            eqvec[has_neigh] = eq[has_neigh]
+
+            vql = np.cross(eqvec, north)
+
+            rj  = neigh_rad
+            erj = neigh_rad + self.settings.rp
+
+            dij = np.linalg.norm(neigh_xyz - atoms.xyz, axis=-1)
+            uij = (neigh_xyz - atoms.xyz) / dij[:,None]
+
+            asymm = (eri*eri - erj*erj) / dij
+            tij = ((atoms.xyz + neigh_xyz) * 0.5) + uij * (asymm[:,None] * 0.5)
+
+            far_sq = (eri + erj)**2 - dij*dij
+            if np.any(far_sq <= 0):
+                raise RuntimeError("Imaginary _far_")
+
+            far = np.sqrt(far_sq)
+
+            contain_sq = dij*dij - (ri - rj)**2
+            if np.any(contain_sq <= 0):
+                raise RuntimeError("Imaginary contain")
+
+            contain = np.sqrt(contain_sq)
+
+            rij = 0.5 * far * contain / dij
+
+            pij = tij + vql * rij[:,None]
+            south_vec = (pij - atoms.xyz) / eri[:,None]
+
+            south[has_neigh] = south_vec[has_neigh]
+
+        # ---------------------------------------------------------
+        # Latitude arcs for ALL atoms simultaneously
+        # ---------------------------------------------------------
+
+        o = np.zeros((N,3))
+
+        cs, lats = self.vec_sub_arc(
+            o,
+            ri,
+            eqvec,
+            atoms.density,
+            north,
+            south
+        )
+
+        # lats: (N, MAX_SUBDIV, 3)
+        valid_lats = ~np.isnan(lats[...,0])
+
+        # dt per atom per latitude
+        dt = np.sum(lats * north[:,None,:], axis=-1)  # (N, M)
+
+        cen = atoms.xyz[:,None,:] + dt[...,None] * north[:,None,:]
+
+        rad_sq = ri[:,None]**2 - dt*dt
+        valid_rad = rad_sq > 0
+
+        rad = np.zeros_like(rad_sq)
+        rad[valid_rad] = np.sqrt(rad_sq[valid_rad])
+
+        # ---------------------------------------------------------
+        # Generate ALL circle points in one call
+        # ---------------------------------------------------------
+
+        ps, points = self.vec_sub_cir(
+            cen.reshape(-1,3),
+            rad.reshape(-1),
+            np.repeat(north, lats.shape[1], axis=0),
+            np.repeat(atoms.density, lats.shape[1])
+        )
+
+        points = points.reshape(N, -1, points.shape[-2], 3)
+        ps = ps.reshape(N, -1)
+
+        valid_points = ~np.isnan(points[...,0])
+
+        area = ps * cs[:,None]
+
+        # ---------------------------------------------------------
+        # Project outward
+        # ---------------------------------------------------------
+
+        points_flat = points[valid_points]
+        atom_idx, lat_idx, circ_idx = np.where(valid_points)
+
+        pcen = atoms.xyz[atom_idx] + (
+            points_flat - atoms.xyz[atom_idx]
+        ) * (eri[atom_idx] / ri[atom_idx])[:,None]
+
+        # ---------------------------------------------------------
+        # Collision check batched
+        # ---------------------------------------------------------
+
+        collisions = self.vec_check_point_collision(
+            pcen[...,None,:],
+            self.run.neighbor_array.xyz[atoms.natom][atom_idx],
+            self.run.neighbor_array.radius[atoms.natom][atom_idx]
+        )
+
+        keep = ~collisions
+
+        points_keep = points_flat[keep]
+        pcen_keep   = pcen[keep]
+        atom_keep   = atom_idx[keep]
+        lat_keep    = lat_idx[keep]
+
+        if points_keep.shape[0] == 0:
+            return 1
+
+        self.run.results.dots.convex += points_keep.shape[0]
+
+        for p, pc, ai, li in zip(points_keep, pcen_keep, atom_keep, lat_keep):
+
+            self.add_dot(
+                atoms.molecule[ai],
+                1,
+                Vec3.from_xyz(p),
+                area[ai, li],
+                Vec3.from_xyz(pc),
+                atoms[ai]
+            )
+
+        return 1
 
 
     def generate_convex_surface(self, atom1):
