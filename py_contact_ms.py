@@ -406,11 +406,72 @@ class AtomArray:
     def __bool__(self):  return self._n > 0
 
     def __getitem__(self, idx):
-        if idx < 0:
-            idx = self._n + idx
-        if idx not in self._views:
-            self._views[idx] = AtomView(self, idx)
-        return self._views[idx]
+
+        # ---------------------------------------------------------
+        # Single integer index → return AtomView (existing behavior)
+        # ---------------------------------------------------------
+        if isinstance(idx, (int, np.integer)):
+
+            if idx < 0:
+                idx = self._n + idx
+
+            if idx < 0 or idx >= self._n:
+                raise IndexError("AtomArray index out of range")
+
+            if idx not in self._views:
+                self._views[idx] = AtomView(self, idx)
+
+            return self._views[idx]
+
+        # ---------------------------------------------------------
+        # Slice or fancy indexing → return new AtomArray
+        # ---------------------------------------------------------
+
+        # Convert slice to explicit indices
+        if isinstance(idx, slice):
+            indices = np.arange(self._n)[idx]
+        else:
+            # boolean mask or fancy index
+            indices = np.asarray(idx)
+
+            if indices.dtype == bool:
+                if indices.shape[0] != self._n:
+                    raise IndexError("Boolean index wrong length")
+                indices = np.nonzero(indices)[0]
+
+        # Handle negative fancy indices
+        indices = np.where(indices < 0, indices + self._n, indices)
+
+        if np.any((indices < 0) | (indices >= self._n)):
+            raise IndexError("AtomArray index out of range")
+
+        # ---------------------------------------------------------
+        # Build new AtomArray
+        # ---------------------------------------------------------
+        new = AtomArray()
+
+        new._n = len(indices)
+        new._cap = new._n
+
+        # Copy numeric fields
+        for f in self._FLOAT_FIELDS + self._INT8_FIELDS + self._INT32_FIELDS:
+            arr = getattr(self, f)
+            setattr(new, f, arr[indices].copy())
+
+        # Copy xyz
+        new.xyz = self.xyz[indices].copy()
+
+        # Copy string fields
+        new.atom_name    = [self.atom_name[i]    for i in indices]
+        new.residue_name = [self.residue_name[i] for i in indices]
+
+        # Fresh view cache
+        new._views = {}
+        for iidx, idx in enumerate(indices):
+            if idx in self._views:
+                new._views[iidx] = self._views[idx]
+
+        return new
 
     def __iter__(self):
         for i in range(self._n):
@@ -1019,7 +1080,7 @@ class MolecularSurfaceCalculator:
             if atom1.atten == ATTEN_6 and not atom1.buried:
                 continue
 
-            self.generate_convex_surface(atom1)
+            self.generate_convex_surface(self.run.atoms[iatom:iatom+1])
 
         # Concave surface
         if self.settings.rp > 0:
@@ -1243,7 +1304,7 @@ class MolecularSurfaceCalculator:
 
         return 0
 
-    def vec_generate_convex_surface(self, atoms):
+    def generate_convex_surface(self, atoms):
 
         N = atoms.xyz.shape[0]
 
@@ -1414,236 +1475,6 @@ class MolecularSurfaceCalculator:
 
         return 1
 
-
-    def generate_convex_surface(self, atom1):
-
-        # neighbors = atom1.neighbors
-
-        north = Vec3(0, 0, 1)
-        south = Vec3(0, 0, -1)
-        eqvec = Vec3(1, 0, 0)
-
-        ri = atom1.radius
-        eri = atom1.radius + self.settings.rp
-
-        if self.run.neighbor_array.nneighbors[atom1.natom]:
-
-            neighbor = Vec3.from_xyz(self.run.neighbor_array.xyz[atom1.natom,0])
-            neighbor_rad = self.run.neighbor_array.radius[atom1.natom,0]
-
-            north = atom1 - neighbor
-            north.normalize()
-
-            vtemp = Vec3(
-                north.y()*north.y() + north.z()*north.z(),
-                north.x()*north.x() + north.z()*north.z(),
-                north.x()*north.x() + north.y()*north.y()
-            )
-            vtemp.normalize()
-
-            dt = vtemp.dot(north)
-            if abs(dt) > 0.99:
-                vtemp = Vec3(1, 0, 0)
-
-            eqvec = north.cross(vtemp)
-            eqvec.normalize()
-
-            vql = eqvec.cross(north)
-
-            rj = neighbor_rad
-            erj = neighbor_rad + self.settings.rp
-
-            dij = atom1.distance(neighbor)
-            uij = (neighbor - atom1) / dij
-
-            asymm = (eri*eri - erj*erj) / dij
-            tij = ((atom1 + neighbor) * 0.5) + (uij * (asymm * 0.5))
-
-            _far_ = (eri + erj)**2 - dij*dij
-            if _far_ <= 0.0:
-                raise RuntimeError("Imaginary _far_")
-
-            _far_ = math.sqrt(_far_)
-
-            contain = dij*dij - (ri - rj)**2
-            if contain <= 0.0:
-                raise RuntimeError("Imaginary contain")
-
-            contain = math.sqrt(contain)
-            rij = 0.5 * _far_ * contain / dij
-
-            pij = tij + (vql * rij)
-            south = (pij - atom1) / eri
-
-            if north.cross(south).dot(eqvec) <= 0.0:
-                raise RuntimeError("Non-positive frame")
-
-        o = np.zeros((1, 3))
-
-        # --- Generate latitude arc points ---
-        cs, lats = self.vec_sub_arc(
-            o,
-            np.array([ri]),
-            eqvec.to_numpy()[None],
-            np.array([atom1.density]),
-            north.to_numpy()[None],
-            south.to_numpy()[None],
-        )
-
-        cs = cs[0]
-        lats = lats[0]  # (MAX_SUBDIV, 3)
-
-        # Remove nan rows
-        valid_lats = ~np.isnan(lats[:, 0])
-        lats = lats[valid_lats]
-
-        if lats.shape[0] == 0:
-            return 0
-
-        north_np = north.to_numpy()
-        atom1_np = atom1.to_numpy()
-
-        # ------------------------------------------------------------------
-        # Vectorize everything over all latitude rings at once
-        # ------------------------------------------------------------------
-
-        # dt for all lats
-        dt = lats @ north_np  # (L,)
-
-        # circle centers
-        cen = atom1_np[None, :] + dt[:, None] * north_np[None, :]  # (L,3)
-
-        # circle radii
-        rad_sq = ri * ri - dt * dt
-        valid_rad = rad_sq > 0.0
-
-        if not np.any(valid_rad):
-            return 1
-
-        cen = cen[valid_rad]
-        rad = np.sqrt(rad_sq[valid_rad])
-        dt = dt[valid_rad]
-
-        L = cen.shape[0]
-
-        # --- Generate all circle points at once ---
-        ps, points = self.vec_sub_cir(
-            cen,
-            rad,
-            np.repeat(north_np[None, :], L, axis=0),
-            np.full(L, atom1.density),
-        )
-
-        # ps: (L,)
-        # points: (L, MAX_SUBDIV, 3)
-
-        # Remove nan points
-        valid_points = ~np.isnan(points[..., 0])
-        counts = np.sum(valid_points, axis=1)
-
-        # area per latitude ring
-        area = ps * cs  # (L,)
-
-        # Broadcast area to match points
-        area_expanded = area[:, None]
-
-        # ------------------------------------------------------------------
-        # Compute projected centers (pcen)
-        # ------------------------------------------------------------------
-
-        points_flat = points[valid_points]
-        lat_indices = np.repeat(np.arange(L), counts)
-
-        pcen = atom1_np + (points_flat - atom1_np) * (eri / ri)
-
-        # ------------------------------------------------------------------
-        # Collision check (fully vectorized)
-        # ------------------------------------------------------------------
-
-        collisions = self.vec_check_point_collision(
-            pcen[..., None, :],
-            self.run.neighbor_array.xyz[atom1.natom],
-            self.run.neighbor_array.radius[atom1.natom],
-        )
-
-        # Filter surviving points
-        keep = ~collisions
-        points_keep = points_flat[keep]
-        pcen_keep = pcen[keep]
-        lat_keep = lat_indices[keep]
-
-        if points_keep.shape[0] == 0:
-            return 1
-
-        # ------------------------------------------------------------------
-        # Final object-based calls (cannot vectorize unless you redesign API)
-        # ------------------------------------------------------------------
-
-        self.run.results.dots.convex += points_keep.shape[0]
-
-        for point_np, pcen_np, li in zip(points_keep, pcen_keep, lat_keep):
-            self.add_dot(
-                atom1.molecule,
-                1,
-                Vec3.from_xyz(point_np),
-                area[li],
-                Vec3.from_xyz(pcen_np),
-                atom1
-            )
-
-
-        # lats0 = []
-        # o = Vec3(0, 0, 0)
-
-        # # cs0 = self.sub_arc(o, ri, eqvec, atom1.density, north, south, lats0)
-        # cs, lats = self.vec_sub_arc(o.to_numpy()[None], np.array([ri]), eqvec.to_numpy()[None], np.array([atom1.density]), north.to_numpy()[None], south.to_numpy()[None])
-        # lats = lats[0]
-        # lats = [Vec3.from_xyz(xyz) for xyz in lats[~np.isnan(lats[:,0])]]
-
-        # if not lats:
-        #     return 0
-
-        # for ilat in lats:
-
-        #     dt = ilat.dot(north)
-        #     cen = atom1 + (north * dt)
-
-        #     rad = ri*ri - dt*dt
-        #     if rad <= 0.0:
-        #         continue
-
-        #     rad = math.sqrt(rad)
-
-        #     # points0 = []
-        #     # ps0 = self.sub_cir(cen, rad, north, atom1.density, points0)
-        #     ps, points = self.vec_sub_cir(cen.to_numpy()[None], np.array([rad]), north.to_numpy()[None], np.array([atom1.density]))
-        #     points = points[0]
-        #     points = points[~np.isnan(points[:,0])]
-        #     ps = ps[0]
-
-        #     if len(points) == 0:
-        #         continue
-
-        #     area = ps * cs
-
-        #     pcen = atom1.to_numpy() + ((points - atom1.to_numpy()) * (eri / ri))
-        #     collisions = self.vec_check_point_collision(pcen[...,None,:], self.run.neighbor_array.xyz[atom1.natom], self.run.neighbor_array.radius[atom1.natom])
-
-        #     for point, pcen in zip(points[~collisions], pcen[~collisions]):
-
-        #         self.run.results.dots.convex += 1
-
-        #         self.add_dot(
-        #             atom1.molecule,
-        #             1,
-        #             Vec3.from_xyz(point),
-        #             area,
-        #             Vec3.from_xyz(pcen),
-        #             atom1
-        #         )
-
-
-        # return 1
 
     def check_point_collision(self, pcen, atoms):
 
