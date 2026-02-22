@@ -1209,6 +1209,13 @@ class MolecularSurfaceCalculator:
 
         eri = atom1.radius + self.settings.rp
 
+        # Pairs to be dispatched to vec_third_loop at the end.
+        tl_a1_idx = []
+        tl_a2_idx = []
+        tl_uij    = []
+        tl_tij    = []
+        tl_rij    = []
+
         for atom2 in neighbors:
 
             if atom2 <= atom1:
@@ -1241,7 +1248,12 @@ class MolecularSurfaceCalculator:
                 atom2.access = 1
                 break
 
-            self.third_loop(atom1, atom2, uij, tij, rij)
+            # Queue this pair for the batched third-loop pass.
+            tl_a1_idx.append(atom1.natom)
+            tl_a2_idx.append(atom2.natom)
+            tl_uij.append(uij.to_numpy())
+            tl_tij.append(tij.to_numpy())
+            tl_rij.append(rij)
 
             if (
                 atom1.atten > ATTEN_BLOCKER or
@@ -1249,97 +1261,218 @@ class MolecularSurfaceCalculator:
             ):
                 self.run.toroid_queue.append((atom1.natom, atom2.natom, uij.to_numpy(), tij.to_numpy(), rij, between))
 
+        # ── dispatch all collected pairs to vec_third_loop ────────────────
+        if tl_a1_idx:
+            access_natoms = self.vec_third_loop(
+                self.run.atoms[np.array(tl_a1_idx, dtype=np.int32)],
+                self.run.atoms[np.array(tl_a2_idx, dtype=np.int32)],
+                np.array(tl_uij, dtype=np.float64),
+                np.array(tl_tij, dtype=np.float64),
+                np.array(tl_rij, dtype=np.float64),
+            )
+            if len(access_natoms):
+                self.run.atoms.access[access_natoms] = 1
+
         return 1
 
 
-    def third_loop(self, atom1, atom2, uij, tij, rij):
+    def vec_third_loop(self, atom1s, atom2s, uij, tij, rij):
+        """
+        Vectorised third_loop over M (atom1, atom2) pairs simultaneously.
 
-        neighbors = atom1.neighbors
+        atom1s : AtomArray  (M rows)
+        atom2s : AtomArray  (M rows)
+        uij    : (M, 3)  unit vector atom1→atom2
+        tij    : (M, 3)  torus-circle centre
+        rij    : (M,)    torus-circle radius
 
-        eri = atom1.radius + self.settings.rp
-        erj = atom2.radius + self.settings.rp
+        Appends valid probes to self.run.probes.
+        Returns a 1-D int32 array of natom indices that should gain access = 1.
+        """
+        M  = len(atom1s)
+        rp = self.settings.rp
 
-        for atom3 in neighbors:
+        eri = atom1s.radius + rp   # (M,)
+        erj = atom2s.radius + rp   # (M,)
+        na1 = atom1s.natom         # (M,)  original atom indices
+        na2 = atom2s.natom         # (M,)
 
-            if atom3 <= atom2:
-                continue
+        # ── neighbour data for every atom1 ───────────────────────────────
+        neigh_xyz   = self.run.neighbor_array.xyz[na1]    # (M, K, 3)
+        neigh_rad   = self.run.neighbor_array.radius[na1]  # (M, K)
+        neigh_natom = self.run.neighbor_array.natom[na1]   # (M, K)
+        K = neigh_xyz.shape[1]
 
-            erk = atom3.radius + self.settings.rp
+        # ── initial (pair, atom3) validity mask ──────────────────────────
+        # atom3 must be ordered after atom2 and be a real neighbour
+        valid = (neigh_natom > na2[:, None]) & (neigh_natom >= 0)  # (M, K)
 
-            djk = atom2.distance(atom3)
-            if djk >= erj + erk:
-                continue
+        erk = np.where(valid, neigh_rad + rp, np.inf)   # (M, K)
 
-            dik = atom1.distance(atom3)
-            if dik >= eri + erk:
-                continue
+        diff_jk = neigh_xyz - atom2s.xyz[:, None, :]    # (M, K, 3)
+        djk     = np.linalg.norm(diff_jk, axis=-1)      # (M, K)
+        valid  &= djk < (erj[:, None] + erk)
 
-            if (
-                atom1.atten <= ATTEN_BLOCKER and
-                atom2.atten <= ATTEN_BLOCKER and
-                atom3.atten <= ATTEN_BLOCKER
-            ):
-                continue
+        diff_ik = neigh_xyz - atom1s.xyz[:, None, :]    # (M, K, 3)
+        dik     = np.linalg.norm(diff_ik, axis=-1)      # (M, K)
+        valid  &= dik < (eri[:, None] + erk)
 
-            uik = (atom3 - atom1) / dik
-            dt = uij.dot(uik)
-            wijk = math.acos(dt)
-            swijk = math.sin(wijk)
+        # all-three-blocked filter
+        safe_na3    = np.where(neigh_natom >= 0, neigh_natom, 0)
+        a3_atten    = self.run.atoms.atten[safe_na3]     # (M, K)
+        all_blocked = (
+            (atom1s.atten[:, None] <= ATTEN_BLOCKER) &
+            (atom2s.atten[:, None] <= ATTEN_BLOCKER) &
+            (a3_atten              <= ATTEN_BLOCKER)
+        )
+        valid &= ~all_blocked
 
-            if dt >= 1.0 or dt <= -1.0 or wijk <= 0.0 or swijk <= 0.0:
+        if not np.any(valid):
+            return np.empty(0, dtype=np.int32)
 
-                dtijk2 = tij.distance(atom3)
-                rkp2 = erk * erk - rij * rij
+        # ── flatten to Q valid triples ────────────────────────────────────
+        pair_idx, k_idx = np.where(valid)   # (Q,)
+        Q = len(pair_idx)
 
-                if dtijk2 < rkp2:
-                    return 0
-                continue
+        a1_xyz_q = atom1s.xyz[pair_idx]              # (Q, 3)
+        a2_xyz_q = atom2s.xyz[pair_idx]              # (Q, 3)
+        a3_xyz_q = neigh_xyz[pair_idx, k_idx]        # (Q, 3)
+        a1_rad_q = atom1s.radius[pair_idx]           # (Q,)
+        a3_rad_q = neigh_rad[pair_idx, k_idx]        # (Q,)
+        na1_q    = na1[pair_idx]                      # (Q,)
+        na2_q    = na2[pair_idx]                      # (Q,)
+        na3_q    = neigh_natom[pair_idx, k_idx]      # (Q,)
+        eri_q    = eri[pair_idx]                     # (Q,)
+        erk_q    = a3_rad_q + rp                     # (Q,)
+        dik_q    = dik[pair_idx, k_idx]              # (Q,)
+        uij_q    = uij[pair_idx]                     # (Q, 3)
+        tij_q    = tij[pair_idx]                     # (Q, 3)
+        rij_q    = rij[pair_idx]                     # (Q,)
 
-            uijk = uij.cross(uik) / swijk
-            utb = uijk.cross(uij)
+        # ── uik, dt, wijk, swijk ─────────────────────────────────────────
+        uik_q    = (a3_xyz_q - a1_xyz_q) / dik_q[:, None]           # (Q, 3)
+        dt_q     = np.einsum('qi,qi->q', uij_q, uik_q)              # (Q,)
+        wijk_q   = np.arccos(np.clip(dt_q, -1.0, 1.0))              # (Q,)
+        swijk_q  = np.sin(wijk_q)                                    # (Q,)
 
-            asymm = (eri * eri - erk * erk) / dik
-            tik = (atom1 + atom3) * 0.5 + uik * asymm * 0.5
+        degenerate = (
+            (dt_q >= 1.0) | (dt_q <= -1.0) |
+            (wijk_q <= 0.0) | (swijk_q <= 0.0)
+        )
 
-            tv = (tik - tij)
-            tv = Vec3(
-                uik.x() * tv.x(),
-                uik.y() * tv.y(),
-                uik.z() * tv.z()
+        # ── degenerate triples: check which ones kill their pair ──────────
+        keep = ~degenerate   # (Q,)  start with non-degenerate only
+
+        if np.any(degenerate):
+            deg = degenerate
+            dtijk2_deg = np.linalg.norm(tij_q[deg] - a3_xyz_q[deg], axis=-1)
+            rkp2_deg   = erk_q[deg]**2 - rij_q[deg]**2
+            kills_q    = np.zeros(Q, dtype=bool)
+            kills_q[deg] = dtijk2_deg < rkp2_deg
+
+            if np.any(kills_q):
+                # Mark every triple that belongs to a killed pair
+                kill_pair_m = np.zeros(M, dtype=bool)
+                kill_pair_m[pair_idx[kills_q]] = True
+                keep &= ~kill_pair_m[pair_idx]
+
+        if not np.any(keep):
+            return np.empty(0, dtype=np.int32)
+
+        # ── apply keep filter ─────────────────────────────────────────────
+        a1_xyz_q = a1_xyz_q[keep];  a3_xyz_q = a3_xyz_q[keep]
+        a1_rad_q = a1_rad_q[keep];  a3_rad_q = a3_rad_q[keep]
+        na1_q    = na1_q[keep];     na2_q    = na2_q[keep];   na3_q  = na3_q[keep]
+        eri_q    = eri_q[keep];     erk_q    = erk_q[keep];   dik_q  = dik_q[keep]
+        uij_q    = uij_q[keep];     tij_q    = tij_q[keep];   rij_q  = rij_q[keep]
+        uik_q    = uik_q[keep];     swijk_q  = swijk_q[keep]
+        pair_idx = pair_idx[keep]
+        Q = len(pair_idx)
+
+        # ── probe geometry ────────────────────────────────────────────────
+        uijk_q  = np.cross(uij_q, uik_q) / swijk_q[:, None]         # (Q, 3)
+        utb_q   = np.cross(uijk_q, uij_q)                            # (Q, 3)
+
+        asymm_q = (eri_q**2 - erk_q**2) / dik_q                     # (Q,)
+        tik_q   = (a1_xyz_q + a3_xyz_q) * 0.5 + uik_q * (asymm_q * 0.5)[:, None]  # (Q, 3)
+
+        # dt = uik · (tik - tij)  [the scalar third_loop computes this as
+        # a component-wise product then sums, which equals the dot product]
+        dt_b_q  = np.einsum('qi,qi->q', uik_q, tik_q - tij_q)       # (Q,)
+        bijk_q  = tij_q + utb_q * (dt_b_q / swijk_q)[:, None]       # (Q, 3)
+
+        hijk_sq_q = eri_q**2 - np.einsum('qi,qi->q', bijk_q - a1_xyz_q, bijk_q - a1_xyz_q)  # (Q,)
+        valid_h   = hijk_sq_q > 0.0
+
+        if not np.any(valid_h):
+            return np.empty(0, dtype=np.int32)
+
+        bijk_q  = bijk_q[valid_h];   uijk_q  = uijk_q[valid_h]
+        hijk_q  = np.sqrt(hijk_sq_q[valid_h])
+        na1_q   = na1_q[valid_h];    na2_q   = na2_q[valid_h];  na3_q = na3_q[valid_h]
+        pair_idx = pair_idx[valid_h]
+        Q = valid_h.sum()
+
+        # ── two probe candidates per triple (isign = +1 and -1) ──────────
+        # +1 half: a0=atom1, a1=atom2, a2=atom3
+        # -1 half: a0=atom2, a1=atom1, a2=atom3
+        bijk_2q  = np.concatenate([bijk_q,  bijk_q ], axis=0)   # (2Q, 3)
+        uijk_2q  = np.concatenate([uijk_q,  uijk_q ], axis=0)   # (2Q, 3)
+        hijk_2q  = np.concatenate([hijk_q,  hijk_q ])            # (2Q,)
+        na1_2q   = np.concatenate([na1_q,   na1_q  ])            # (2Q,)
+        na2_2q   = np.concatenate([na2_q,   na2_q  ])            # (2Q,)
+        na3_2q   = np.concatenate([na3_q,   na3_q  ])            # (2Q,)
+        isign_2q = np.concatenate([np.ones(Q), -np.ones(Q)])     # (2Q,)
+
+        pijk_2q  = bijk_2q + uijk_2q * (hijk_2q * isign_2q)[:, None]   # (2Q, 3)
+        alt_2q   = uijk_2q * isign_2q[:, None]                          # (2Q, 3)
+
+        probe_a0 = np.where(isign_2q > 0, na1_2q, na2_2q)   # (2Q,)
+        probe_a1 = np.where(isign_2q > 0, na2_2q, na1_2q)   # (2Q,)
+        probe_a2 = na3_2q                                     # (2Q,)
+
+        # ── collision check ───────────────────────────────────────────────
+        # na1_2q indexes the atom whose neighbour list we check against
+        coll_xyz   = self.run.neighbor_array.xyz[na1_2q]    # (2Q, K, 3)
+        coll_rad   = self.run.neighbor_array.radius[na1_2q]  # (2Q, K)
+        coll_natom = self.run.neighbor_array.natom[na1_2q]   # (2Q, K)
+
+        diff_c  = pijk_2q[:, None, :] - coll_xyz             # (2Q, K, 3)
+        d2_coll = np.einsum('pki,pki->pk', diff_c, diff_c)   # (2Q, K)
+
+        # exclude the two generating atoms (atom2 and atom3) and padding slots
+        exclude   = (
+            (coll_natom == na2_2q[:, None]) |
+            (coll_natom == na3_2q[:, None]) |
+            (coll_natom < 0)
+        )
+        within    = (d2_coll <= (coll_rad + rp)**2) & ~exclude & ~np.isnan(coll_rad)
+        collision = within.any(axis=-1)                      # (2Q,)
+
+        valid_probe = ~collision
+        if not np.any(valid_probe):
+            return np.empty(0, dtype=np.int32)
+
+        # ── write probes ──────────────────────────────────────────────────
+        pijk_f     = pijk_2q[valid_probe]
+        alt_f      = alt_2q[valid_probe]
+        hijk_f     = hijk_2q[valid_probe]
+        probe_a0_f = probe_a0[valid_probe].astype(np.int32)
+        probe_a1_f = probe_a1[valid_probe].astype(np.int32)
+        probe_a2_f = probe_a2[valid_probe].astype(np.int32)
+
+        for i in range(len(pijk_f)):
+            self.run.probes.append(
+                int(probe_a0_f[i]),
+                int(probe_a1_f[i]),
+                int(probe_a2_f[i]),
+                float(hijk_f[i]),
+                Vec3.from_xyz(pijk_f[i]),
+                Vec3.from_xyz(alt_f[i]),
             )
 
-            dt = tv.x() + tv.y() + tv.z()
-            bijk = tij + utb * (dt / swijk)
-
-            hijk = eri * eri - bijk.distance_squared(atom1)
-            if hijk <= 0.0:
-                continue
-
-            hijk = math.sqrt(hijk)
-
-            for is0 in (1, 2):
-
-                isign = 3 - 2 * is0
-                pijk = bijk + uijk * (hijk * isign)
-
-                if self.check_atom_collision2(pijk, atom2, atom3, neighbors):
-                    continue
-
-                if isign > 0:
-                    a0, a1, a2 = atom1, atom2, atom3
-                else:
-                    a0, a1, a2 = atom2, atom1, atom3
-
-                self.run.probes.append(
-                    a0._idx, a1._idx, a2._idx,
-                    hijk, pijk, uijk * isign,
-                )
-
-                atom1.access = 1
-                atom2.access = 1
-                atom3.access = 1
-
-        return 1
+        # ── return natoms that gained access ─────────────────────────────
+        return np.unique(np.concatenate([probe_a0_f, probe_a1_f, probe_a2_f]))
 
     def check_atom_collision2(self, pijk, atom1, atom2, atoms):
 

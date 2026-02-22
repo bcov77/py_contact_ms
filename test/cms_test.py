@@ -272,6 +272,7 @@ def compare_runs(current, golden, tol=TOLERANCE):
         'probes', current.probes, golden.probes,
         ['height', 'point_x', 'point_y', 'point_z', 'alt_x', 'alt_y', 'alt_z'],
         tol, diffs,
+        sort_keys=['point_x', 'point_y', 'point_z'],
     )
 
     return diffs
