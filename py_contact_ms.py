@@ -1095,30 +1095,19 @@ class MolecularSurfaceCalculator:
 
         good_atom = self.build_neighbor_arrays()
 
+        # Run second_loop for all good atoms at once
+        good_indices = np.where(good_atom)[0]
+        self.second_loop(self.run.atoms[good_indices])
 
-        # Generate convex surfaces
-        for iatom, atom1 in enumerate(self.run.atoms):
-            if not good_atom[iatom]:
-                continue
+        # Build convex_queue (vectorised filter over good atoms)
+        atten    = self.run.atoms.atten[good_indices]
+        access   = self.run.atoms.access[good_indices].astype(bool)
+        n_buried = self.run.buried_array.nneighbors[good_indices]
 
-            self.second_loop(atom1)
-
-            if not self.run.neighbor_array.nneighbors[atom1.natom]:
-                continue
-
-            # if not self.find_neighbors_and_buried_atoms(atom1):
-            #     continue
-
-            if not atom1.access:
-                continue
-
-            if atom1.atten <= ATTEN_BLOCKER:
-                continue
-
-            if atom1.atten == ATTEN_6 and not self.run.buried_array.nneighbors[atom1.natom]:
-                continue
-
-            self.run.convex_queue.append(iatom)
+        convex_mask = (access
+                       & (atten > ATTEN_BLOCKER)
+                       & ~((atten == ATTEN_6) & (n_buried == 0)))
+        self.run.convex_queue = list(good_indices[convex_mask])
 
         self.generate_convex_surface(self.run.atoms[self.run.convex_queue])
 
@@ -1249,154 +1238,98 @@ class MolecularSurfaceCalculator:
         self.run.buried_array   = buried_array
         return good_atom
 
-    import math
+    def second_loop(self, atoms):
+        """
+        Vectorised second_loop over all atoms simultaneously.
 
-    def find_neighbors_for_atom(self, atom1):
+        atoms : AtomArray — all good atoms to process (pre-filtered by good_atom mask)
+        """
+        if len(atoms) == 0:
+            return
 
-        neighbors = atom1.neighbors
-        if len(neighbors) != 0:
-            raise RuntimeError("atom1.neighbors not empty before neighbor search")
+        rp  = self.settings.rp
+        na1 = atoms.natom                                        # (N,) original indices
 
-        bb2 = (4 * self.run.radmax + 4 * self.settings.rp) ** 2
-        nbb = 0
+        # ── neighbour data for all atoms at once ──────────────────────────
+        nneigh      = self.run.neighbor_array.nneighbors[na1]   # (N,)
+        neigh_xyz   = self.run.neighbor_array.xyz[na1]          # (N, K, 3)
+        neigh_rad   = self.run.neighbor_array.radius[na1]       # (N, K)
+        neigh_natom = self.run.neighbor_array.natom[na1]        # (N, K)
 
-        for atom2 in self.run.atoms:
+        # ── forward-pair mask: only pairs where natom2 > natom1 ──────────
+        fwd = neigh_natom > na1[:, None]                        # (N, K)
 
-            if atom1 is atom2 or atom2.atten <= 0:
-                continue
+        # ── geometry for all (atom, forward-neighbor) pairs ───────────────
+        # Use np.where before sqrt to keep non-fwd entries finite (avoids NaN warnings).
+        diff   = neigh_xyz - atoms.xyz[:, None, :]              # (N, K, 3)
+        dij_sq = np.einsum('nki,nki->nk', diff, diff)           # (N, K)
+        dij    = np.sqrt(np.where(fwd, dij_sq, 1.0))            # (N, K)
 
-            if atom1.molecule == atom2.molecule:
+        eri = atoms.radius + rp                                  # (N,)
+        erj = neigh_rad   + rp                                   # (N, K) — NaN for padding
 
-                d2 = atom1.distance_squared(atom2)
+        asymm   = np.where(fwd, (eri[:, None]**2 - erj**2) / dij, 0.0)  # (N, K)
+        between = np.abs(asymm) < dij                            # (N, K)
+        tij     = ((atoms.xyz[:, None, :] + neigh_xyz) * 0.5
+                   + (diff / dij[..., None]) * (asymm * 0.5)[..., None])  # (N, K, 3)
 
-                if d2 <= 0.0001:
-                    raise RuntimeError(
-                        f"Coincident atoms: "
-                        f"{atom1.natom}:{atom1.residue}:{atom1.atom} == "
-                        f"{atom2.natom}:{atom2.residue}:{atom2.atom}"
-                    )
+        far_sq  = np.where(fwd, (eri[:, None] + erj)**2 - dij_sq, -1.0)  # (N, K)
+        cont_sq = np.where(fwd, dij_sq - (atoms.radius[:, None] - neigh_rad)**2, -1.0)  # (N, K)
 
-                bridge = atom1.radius + atom2.radius + 2 * self.settings.rp
+        geom_ok = fwd & (far_sq > 0.0) & (cont_sq > 0.0)       # (N, K)
 
-                if d2 >= bridge * bridge:
-                    continue
+        # ── single-neighbour shortcut ─────────────────────────────────────
+        # Fires per-atom when nneigh <= 1 and there is at least one valid forward pair.
+        shortcut = (nneigh <= 1) & geom_ok.any(axis=1)          # (N,)
+        if shortcut.any():
+            sc_na1 = na1[shortcut]
+            self.run.atoms.access[sc_na1] = 1
+            # First geom_ok forward neighbour for each shortcut atom
+            first_k  = np.argmax(geom_ok[shortcut], axis=1)     # (S,)
+            first_na2 = neigh_natom[shortcut][np.arange(shortcut.sum()), first_k]
+            self.run.atoms.access[first_na2.astype(np.int32)] = 1
 
-                neighbors.append(atom2)
+        # ── flatten all non-shortcut, geom_ok pairs ───────────────────────
+        pair_mask      = geom_ok & ~shortcut[:, None]           # (N, K)
+        i_idx, k_idx   = np.where(pair_mask)
 
-            else:
+        if len(i_idx) == 0:
+            return
 
-                if atom2.atten < ATTEN_BURIED_FLAGGED:
-                    continue
-
-                d2 = atom1.distance_squared(atom2)
-
-                if d2 < bb2:
-                    nbb += 1
-
-                bridge = atom1.radius + atom2.radius + 2 * self.settings.rp
-
-                if d2 >= bridge * bridge:
-                    continue
-
-                atom1.buried.append(atom2)
-
-        if atom1.atten == ATTEN_6 and not nbb:
-            return 0
-
-        if not neighbors:
-            atom1.access = 1
-            return 0
-
-        return len(neighbors)
-
-    import math
-
-    def second_loop(self, atom1):
-
-        na1    = atom1.natom
-        nneigh = int(self.run.neighbor_array.nneighbors[na1])
-
-        if nneigh == 0:
-            return 1
-
-        # ── pull neighbour data from the pre-built array ──────────────────
-        neigh_xyz   = self.run.neighbor_array.xyz[na1,   :nneigh]   # (K, 3)
-        neigh_rad   = self.run.neighbor_array.radius[na1, :nneigh]  # (K,)
-        neigh_natom = self.run.neighbor_array.natom[na1,  :nneigh]  # (K,)
-
-        # ── ordering guard: only pairs where natom2 > natom1 ─────────────
-        fwd = neigh_natom > na1                                      # (K,)
-        if not np.any(fwd):
-            return 1
-
-        v_xyz   = neigh_xyz[fwd]    # (K', 3)
-        v_rad   = neigh_rad[fwd]    # (K',)
-        v_natom = neigh_natom[fwd]  # (K',)
-
-        # ── geometry for all forward pairs ────────────────────────────────
-        a1_xyz = self.run.atoms.xyz[na1]            # (3,)
-        eri    = atom1.radius + self.settings.rp    # scalar
-
-        erj     = v_rad + self.settings.rp          # (K',)
-        diff    = v_xyz - a1_xyz[None, :]           # (K', 3)
-        dij     = np.linalg.norm(diff, axis=-1)     # (K',)
-        uij     = diff / dij[:, None]               # (K', 3)
-
-        asymm   = (eri**2 - erj**2) / dij           # (K',)
-        between = np.abs(asymm) < dij               # (K',)
-        tij     = (a1_xyz[None, :] + v_xyz) * 0.5 + uij * (asymm * 0.5)[:, None]  # (K', 3)
-
-        far_sq  = (eri + erj)**2 - dij**2           # (K',)
-        cont_sq = dij**2 - (atom1.radius - v_rad)**2  # (K',)
-
-        geom_ok = (far_sq > 0.0) & (cont_sq > 0.0)  # (K',)
-        if not np.any(geom_ok):
-            return 1
-
-        uij_f     = uij[geom_ok]                    # (K'', 3)
-        tij_f     = tij[geom_ok]                    # (K'', 3)
-        rij_f     = (0.5 * np.sqrt(far_sq[geom_ok])
-                        * np.sqrt(cont_sq[geom_ok])
-                        / dij[geom_ok])             # (K'',)
-        v_natom_f = v_natom[geom_ok]                # (K'',)
-        between_f = between[geom_ok]                # (K'',)
-        Kpp       = int(uij_f.shape[0])
-
-        # ── single-neighbour shortcut (mirrors `len(neighbors) <= 1`) ────
-        if nneigh <= 1:
-            atom1.access = 1
-            self.run.atoms.access[v_natom_f[0]] = 1
-            return 1
+        na1_f  = na1[i_idx]                                      # (P,)
+        na2_f  = neigh_natom[i_idx, k_idx].astype(np.int32)     # (P,)
+        dij_f  = dij[i_idx, k_idx]                               # (P,)
+        uij_f  = diff[i_idx, k_idx] / dij_f[:, None]            # (P, 3)
+        tij_f  = tij[i_idx, k_idx]                               # (P, 3)
+        rij_f  = (0.5 * np.sqrt(far_sq[i_idx, k_idx])
+                      * np.sqrt(cont_sq[i_idx, k_idx])
+                      / dij_f)                                    # (P,)
+        bet_f  = between[i_idx, k_idx]                           # (P,)
 
         # ── toroid queue ──────────────────────────────────────────────────
-        v_atten_f   = self.run.atoms.atten[v_natom_f]  # (K'',)
-        need_toroid = (
-            (atom1.atten > ATTEN_BLOCKER) |
-            ((v_atten_f > ATTEN_BLOCKER) & (self.settings.rp > 0.0))
-        )
-        for i in np.where(need_toroid)[0]:
+        a1_atten = atoms.atten[i_idx]                            # (P,)
+        a2_atten = self.run.atoms.atten[na2_f]                   # (P,)
+        need_tor = (a1_atten > ATTEN_BLOCKER) | ((a2_atten > ATTEN_BLOCKER) & (rp > 0.0))
+        for i in np.where(need_tor)[0]:
             self.run.toroid_queue.append((
-                na1,
-                int(v_natom_f[i]),
+                int(na1_f[i]),
+                int(na2_f[i]),
                 uij_f[i],
                 tij_f[i],
                 float(rij_f[i]),
-                bool(between_f[i]),
+                bool(bet_f[i]),
             ))
 
-        # ── vec_third_loop ────────────────────────────────────────────────
-        na1_arr       = np.full(Kpp, na1, dtype=np.int32)
+        # ── vec_third_loop (single call across all pairs) ─────────────────
         access_natoms = self.vec_third_loop(
-            self.run.atoms[na1_arr],
-            self.run.atoms[v_natom_f.astype(np.int32)],
+            self.run.atoms[na1_f],
+            self.run.atoms[na2_f],
             uij_f,
             tij_f,
             rij_f,
         )
         if len(access_natoms):
             self.run.atoms.access[access_natoms] = 1
-
-        return 1
 
 
     def vec_third_loop(self, atom1s, atom2s, uij, tij, rij):
@@ -1597,20 +1530,6 @@ class MolecularSurfaceCalculator:
         # ── return natoms that gained access ─────────────────────────────
         return np.unique(np.concatenate([probe_a0_f, probe_a1_f, probe_a2_f]))
 
-    def check_atom_collision2(self, pijk, atom1, atom2, atoms):
-
-        for neighbor in atoms:
-
-            if neighbor is atom1 or neighbor is atom2:
-                continue
-
-            if (
-                pijk.distance_squared(neighbor)
-                <= (neighbor.radius + self.settings.rp) ** 2
-            ):
-                return 1
-
-        return 0
 
     def generate_convex_surface(self, atoms):
 
@@ -2306,39 +2225,6 @@ class MolecularSurfaceCalculator:
                 outnml[mask, 0], outnml[mask, 1], outnml[mask, 2],
                 area[mask], buried[mask], type_arr[mask], atom_indices[mask],
             )
-
-    def add_dot(
-        self,
-        molecule,
-        type_,
-        coor,
-        area,
-        pcen,
-        atom
-    ):
-        pradius = self.settings.rp
-
-        # outward normal
-        if pradius <= 0:
-            outnml = coor - atom   # Vec3 - AtomView → Vec3
-        else:
-            outnml = (pcen - coor) / pradius
-
-        # buried determination
-        d2 = np.square(self.run.buried_array.xyz[atom.natom] - pcen.to_numpy()).sum(axis=-1)
-        buried = (d2 <= (self.run.buried_array.radius[atom.natom] + pradius)**2).any()
-
-        # These are just here for the regression test
-        self.run.prevp      = pcen
-        self.run.prevburied = buried
-
-        self.run.dots[molecule].append(
-            coor.x_,    coor.y_,    coor.z_,
-            outnml.x_,  outnml.y_,  outnml.z_,
-            area, buried, type_,
-            atom._idx,   # AtomView carries its index into AtomArray
-        )
-
 
 
     def vec_distance_point_to_line(self, cen, axis, pnt):
