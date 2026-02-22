@@ -724,6 +724,8 @@ class MolecularSurfaceCalculator:
         self.run.prevburied = 0
         self.run.neighbor_array = None
         self.run.buried_array = None
+        self.run.convex_queue = []
+        self.run.toroid_queue = []
 
 
     def calc(self, pose, jump_id=1):
@@ -1108,7 +1110,11 @@ class MolecularSurfaceCalculator:
             if atom1.atten == ATTEN_6 and not atom1.buried:
                 continue
 
-            self.generate_convex_surface(self.run.atoms[iatom:iatom+1])
+            self.run.convex_queue.append(iatom)
+
+        self.generate_convex_surface(self.run.atoms[self.run.convex_queue])
+
+        self.generate_toroidal_surfaces()
 
         self.run.probes.finalize()
         # Concave surface
@@ -1116,6 +1122,23 @@ class MolecularSurfaceCalculator:
             self.generate_concave_surface()
 
         return 1
+
+
+    def generate_toroidal_surfaces(self):
+
+        natoms1 = [x[0] for x in self.run.toroid_queue]
+        natoms2 = [x[1] for x in self.run.toroid_queue]
+        uijs = np.array([x[2] for x in self.run.toroid_queue])
+        tijs = np.array([x[3] for x in self.run.toroid_queue])
+        rijs = np.array([x[4] for x in self.run.toroid_queue])
+        betweens = np.array([x[5] for x in self.run.toroid_queue])
+
+        atom1_has_access, atom2_has_access = self.generate_toroidal_surface(
+                                                                self.run.atoms[natoms1],
+                                                                self.run.atoms[natoms2],
+                                                                uijs, tijs, rijs, betweens)
+        self.run.atoms.access[natoms1] |= atom1_has_access
+        self.run.atoms.access[natoms2] |= atom2_has_access
 
 
     import math
@@ -1224,12 +1247,7 @@ class MolecularSurfaceCalculator:
                 atom1.atten > ATTEN_BLOCKER or
                 (atom2.atten > ATTEN_BLOCKER and self.settings.rp > 0.0)
             ):
-                atom1_has_access, atom2_has_access = self.generate_toroidal_surface(
-                                                                        self.run.atoms[atom1.natom:atom1.natom+1],
-                                                                        self.run.atoms[atom2.natom:atom2.natom+1],
-                                                                        uij.to_numpy()[None], tij.to_numpy()[None], np.array([rij]), np.array([between]))
-                self.run.atoms.access[atom1.natom:atom1.natom+1] |= atom1_has_access
-                self.run.atoms.access[atom2.natom:atom2.natom+1] |= atom2_has_access
+                self.run.toroid_queue.append((atom1.natom, atom2.natom, uij.to_numpy(), tij.to_numpy(), rij, between))
 
         return 1
 
