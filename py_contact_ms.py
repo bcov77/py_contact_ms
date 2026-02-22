@@ -1211,7 +1211,12 @@ class MolecularSurfaceCalculator:
                 atom1.atten > ATTEN_BLOCKER or
                 (atom2.atten > ATTEN_BLOCKER and self.settings.rp > 0.0)
             ):
-                self.generate_toroidal_surface(atom1, atom2, uij, tij, rij, between)
+                atom1_has_access, atom2_has_access = self.generate_toroidal_surface(
+                                                                        self.run.atoms[atom1.natom:atom1.natom+1],
+                                                                        self.run.atoms[atom2.natom:atom2.natom+1],
+                                                                        uij.to_numpy()[None], tij.to_numpy()[None], np.array([rij]), np.array([between]))
+                self.run.atoms.access[atom1.natom:atom1.natom+1] |= atom1_has_access
+                self.run.atoms.access[atom2.natom:atom2.natom+1] |= atom2_has_access
 
         return 1
 
@@ -1503,134 +1508,215 @@ class MolecularSurfaceCalculator:
 
     import math
 
+
     def generate_toroidal_surface(
         self,
         atom1,
         atom2,
-        uij,
-        tij,
-        rij,
-        between
+        uij,      # (N,3)
+        tij,      # (N,3)
+        rij,      # (N,)
+        between   # (N,)
     ):
 
-        neighbors = atom1.neighbors
+        N = atom1.xyz.shape[0]
 
-        neigh_xyz = self.run.neighbor_array.xyz[atom1.natom]
-        neigh_rad = self.run.neighbor_array.radius[atom1.natom]
-        neigh_natom = self.run.neighbor_array.natom[atom1.natom]
+        neigh_xyz   = self.run.neighbor_array.xyz[atom1.natom]      # (N,K,3)
+        neigh_rad   = self.run.neighbor_array.radius[atom1.natom]   # (N,K)
+        neigh_natom = self.run.neighbor_array.natom[atom1.natom]    # (N,K)
 
-        density = (atom1.density + atom2.density) / 2.0
+        density = (atom1.density + atom2.density) * 0.5
 
         eri = atom1.radius + self.settings.rp
         erj = atom2.radius + self.settings.rp
 
         rci = rij * atom1.radius / eri
         rcj = rij * atom2.radius / erj
-        rb = rij - self.settings.rp
-        if rb <= 0.0:
-            rb = 0.0
+        rb  = np.maximum(rij - self.settings.rp, 0.0)
 
-        rs = (rci + 2 * rb + rcj) / 4.0
+        rs = (rci + 2*rb + rcj) * 0.25
         e = rs / rij
         edens = e * e * density
 
-        subs0 = []
-        ts0 = self.sub_cir(tij, rij, uij, edens, subs0)
+        # ---------------------------------------------------------
+        # Subdivide torus circle (batched)
+        # ---------------------------------------------------------
 
-        ts, subs = self.vec_sub_cir(tij.to_numpy()[None], np.array([rij]), uij.to_numpy()[None], np.array([edens]))
-        ts = ts[0]
-        subs = subs[0]
-        subs = [Vec3.from_xyz(xyz) for xyz in subs[~np.isnan(subs[:,0])]]
+        ts, subs = self.vec_sub_cir(
+            tij,
+            rij,
+            uij,
+            edens
+        )
 
+        # subs: (N, M, 3)
+        valid_sub = ~np.isnan(subs[...,0])
 
-        if not subs:
-            return 0
+        if not np.any(valid_sub):
+            return (
+                np.zeros(N, dtype=bool),
+                np.zeros(N, dtype=bool)
+            )
 
-        for sub in subs:
+        # Flatten valid subdivisions
+        atom_idx, sub_idx = np.where(valid_sub)
+        pij = subs[atom_idx, sub_idx]      # (Q,3)
 
-            d2 = np.square(sub.to_numpy() - neigh_xyz).sum(axis=-1)
-            mask = (neigh_natom != atom2.natom) & ~np.isnan(d2)
-            tooclose = (d2 < (neigh_rad + self.settings.rp)**2)[mask].any()
+        # ---------------------------------------------------------
+        # Neighbor collision test (vectorized)
+        # ---------------------------------------------------------
 
-            if tooclose:
-                continue
+        neigh_xyz_flat = neigh_xyz[atom_idx]      # (Q,K,3)
+        neigh_rad_flat = neigh_rad[atom_idx]
+        neigh_natom_flat = neigh_natom[atom_idx]
 
-            pij = sub
-            atom1.access = 1
-            atom2.access = 1
+        d2 = np.sum((pij[:,None,:] - neigh_xyz_flat)**2, axis=-1)
 
-            if (
-                atom1.atten == ATTEN_6 and
-                atom2.atten == ATTEN_6 and
-                not atom1.buried
-            ):
-                continue
+        mask = (neigh_natom_flat != atom2.natom[atom_idx,None])
+        too_close = (d2 < (neigh_rad_flat + self.settings.rp)**2) & mask
 
-            pi = (atom1 - pij) / eri
-            pj = (atom2 - pij) / erj
+        valid_point = ~np.any(too_close, axis=-1)
 
-            axis = pi.cross(pj)
-            axis.normalize()
+        valid_point &= ~ ((atom1[atom_idx].atten == ATTEN_6)
+                        & (atom2[atom_idx].atten == ATTEN_6)
+                        & (self.run.buried_array.nneighbors[atom1[atom_idx].natom] == 0)
+                        )
 
-            dtq = self.settings.rp ** 2 - rij ** 2
-            pcusp = dtq > 0 and between
+        if not np.any(valid_point):
+            return (
+                np.zeros(N, dtype=bool),
+                np.zeros(N, dtype=bool)
+            )
 
-            if pcusp:
-                dtq = math.sqrt(dtq)
-                qij = tij - uij * dtq
-                qjk = tij + uij * dtq
-                pqi = (qij - pij) / self.settings.rp
-                pqj = Vec3(0.0, 0.0, 0.0)
-            else:
-                pqi = pi + pj
-                pqi.normalize()
-                pqj = pqi
+        pij = pij[valid_point]
+        atom_idx = atom_idx[valid_point]
 
-            dt = pqi.dot(pi)
-            if dt >= 1.0 or dt <= -1.0:
-                return 0
+        # Mark access
+        atom1_has_access = np.zeros(N, dtype=bool)
+        atom2_has_access = np.zeros(N, dtype=bool)
 
-            dt = pqj.dot(pj)
-            if dt >= 1.0 or dt <= -1.0:
-                return 0
+        atom1_has_access[atom_idx] = True
+        atom2_has_access[atom_idx] = True
 
-            # Arc for atom1
-            if atom1.atten >= ATTEN_2:
-                points = []
-                ps, points = self.vec_sub_arc(pij.to_numpy()[None], np.array([self.settings.rp]), axis.to_numpy()[None],
-                                  np.array([density]), pi.to_numpy()[None], pqi.to_numpy()[None])
-                ps = ps[0]
-                points = points[0]
+        # ---------------------------------------------------------
+        # Geometry
+        # ---------------------------------------------------------
 
-                areas = ps * ts * self.vec_distance_point_to_line(tij.to_numpy()[None], uij.to_numpy()[None], points) / rij
-                mask = ~np.isnan(areas)
+        pi = (atom1.xyz[atom_idx] - pij) / eri[atom_idx,None]
+        pj = (atom2.xyz[atom_idx] - pij) / erj[atom_idx,None]
 
-                for point, area in zip(points[mask], areas[mask]):
+        axis = np.cross(pi, pj)
+        axis /= np.linalg.norm(axis, axis=-1, keepdims=True)
 
-                    self.run.results.dots.toroidal += 1
-                    self.add_dot(atom1.molecule, 2,
-                                 Vec3.from_xyz(point), area, pij, atom1)
+        dtq = self.settings.rp**2 - rij[atom_idx]**2
+        pcusp = (dtq > 0) & between[atom_idx]
 
-            # Arc for atom2
-            if atom2.atten >= ATTEN_2:
+        pqi = np.empty_like(pi)
+        pqj = np.empty_like(pi)
 
+        if np.any(pcusp):
 
-                # points = []
-                ps, points = self.vec_sub_arc(pij.to_numpy()[None], np.array([self.settings.rp]), axis.to_numpy()[None],
-                                  np.array([density]), pqj.to_numpy()[None], pj.to_numpy()[None])
-                ps = ps[0]
-                points = points[0]
+            dtq_s = np.sqrt(dtq[pcusp])
+            qij = tij[atom_idx[pcusp]] - uij[atom_idx[pcusp]] * dtq_s[:,None]
+            qjk = tij[atom_idx[pcusp]] + uij[atom_idx[pcusp]] * dtq_s[:,None]
 
-                areas = ps * ts * self.vec_distance_point_to_line(tij.to_numpy()[None], uij.to_numpy()[None], points) / rij
-                mask = ~np.isnan(areas)
+            pqi[pcusp] = (qij - pij[pcusp]) / self.settings.rp
+            pqj[pcusp] = 0.0
 
-                for point, area in zip(points[mask], areas[mask]):
+        if np.any(~pcusp):
 
-                    self.run.results.dots.toroidal += 1
-                    self.add_dot(atom1.molecule, 2,
-                                 Vec3.from_xyz(point), area, pij, atom2)
+            tmp = pi[~pcusp] + pj[~pcusp]
+            tmp /= np.linalg.norm(tmp, axis=-1, keepdims=True)
+            pqi[~pcusp] = tmp
+            pqj[~pcusp] = tmp
 
-        return 1
+        # Reject invalid dot cases
+        dt1 = np.sum(pqi * pi, axis=-1)
+        dt2 = np.sum(pqj * pj, axis=-1)
+
+        valid_angle = (np.abs(dt1) < 1.0) & (np.abs(dt2) < 1.0)
+
+        if not np.any(valid_angle):
+            return atom1_has_access, atom2_has_access
+
+        pij = pij[valid_angle]
+        axis = axis[valid_angle]
+        pi = pi[valid_angle]
+        pj = pj[valid_angle]
+        pqi = pqi[valid_angle]
+        pqj = pqj[valid_angle]
+        atom_idx = atom_idx[valid_angle]
+
+        # ---------------------------------------------------------
+        # Arc generation (batched)
+        # ---------------------------------------------------------
+
+        areas_total = 0
+
+        # ---- atom1 arc ----
+        mask1 = atom1.atten[atom_idx] >= ATTEN_2
+        if np.any(mask1):
+
+            ps, points = self.vec_sub_arc(
+                pij[mask1],
+                np.full(np.sum(mask1), self.settings.rp),
+                axis[mask1],
+                density[atom_idx[mask1]],
+                pi[mask1],
+                pqi[mask1]
+            )
+
+            dist = self.vec_distance_point_to_line(
+                tij[atom_idx[mask1]][...,None,:],
+                uij[atom_idx[mask1]][...,None,:],
+                points
+            )
+
+            expanded_pij = np.zeros(points.shape)
+            expanded_pij[:] = pij[mask1][:,None,:]
+            areas = ps[:,None] * ts[atom_idx[mask1],None] * dist / rij[atom_idx[mask1],None]
+            valid = ~np.isnan(areas)
+
+            for point, area, atom1_, atom2_, pij_ in zip(points[valid], areas[valid], atom1[atom_idx][mask1][valid], atom2[atom_idx][mask1][valid], expanded_pij[valid]):
+                self.run.results.dots.toroidal += 1
+                self.add_dot(atom1_.molecule, 2,
+                                 Vec3.from_xyz(point), area, Vec3.from_xyz(pij_), atom1_)
+
+            # areas_total += np.sum(valid)
+
+        # ---- atom2 arc ----
+        mask2 = atom2.atten[atom_idx] >= ATTEN_2
+        if np.any(mask2):
+
+            ps, points = self.vec_sub_arc(
+                pij[mask2],
+                np.full(np.sum(mask2), self.settings.rp),
+                axis[mask2],
+                density[atom_idx[mask2]],
+                pqj[mask2],
+                pj[mask2]
+            )
+
+            dist = self.vec_distance_point_to_line(
+                tij[atom_idx[mask2]][...,None,:],
+                uij[atom_idx[mask2]][...,None,:],
+                points
+            )
+
+            expanded_pij = np.zeros(points.shape)
+            expanded_pij[:] = pij[mask2][:,None,:]
+            areas = ps[:,None] * ts[atom_idx[mask2],None] * dist / rij[atom_idx[mask2],None]
+            valid = ~np.isnan(areas)
+
+            for point, area, atom1_, atom2_, pij_ in zip(points[valid], areas[valid], atom1[atom_idx][mask2][valid], atom2[atom_idx][mask2][valid], expanded_pij[valid]):
+                self.run.results.dots.toroidal += 1
+                self.add_dot(atom1_.molecule, 2,
+                                 Vec3.from_xyz(point), area, Vec3.from_xyz(pij_), atom2_)
+            # areas_total += np.sum(valid)
+
+        # self.run.results.dots.toroidal += areas_total
+
+        return atom1_has_access, atom2_has_access
 
     def generate_concave_surface(self):
 

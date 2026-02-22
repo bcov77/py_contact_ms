@@ -184,15 +184,23 @@ def _check_scalar(name, cur, gold, tol, out):
         out.append(f"  {name}: {gold:.6g} -> {cur:.6g} ({sign}{pct:.2f}%)")
 
 
-def _check_dict_list(name, cur_list, gold_list, numeric_keys, tol, out):
+def _check_dict_list(name, cur_list, gold_list, numeric_keys, tol, out,
+                     sort_keys=None):
     """
     Compare two parallel lists of dicts.  Reports count mismatches and, for
     each numeric key, how many elements exceed the tolerance and the worst
     relative difference seen.
+
+    If *sort_keys* is provided (a sequence of dict keys), both lists are
+    sorted by those keys before comparison so element order is irrelevant.
     """
     if len(cur_list) != len(gold_list):
         out.append(f"  {name} count: {len(gold_list)} -> {len(cur_list)}")
         return
+
+    if sort_keys:
+        cur_list  = sorted(cur_list,  key=lambda d: tuple(d[k] for k in sort_keys))
+        gold_list = sorted(gold_list, key=lambda d: tuple(d[k] for k in sort_keys))
 
     n = len(cur_list)
     for key in numeric_keys:
@@ -244,17 +252,20 @@ def compare_runs(current, golden, tol=TOLERANCE):
     )
 
     # dots
-    dot_keys = ['coor_x', 'coor_y', 'coor_z', 'area', 'buried', 'type', 'atom_idx']
+    dot_keys      = ['coor_x', 'coor_y', 'coor_z', 'area', 'buried', 'type', 'atom_idx']
+    dot_sort_keys = ['coor_x', 'coor_y', 'coor_z']
     for mol in range(2):
         _check_dict_list(f'dots[{mol}]',
                          current.dots[mol], golden.dots[mol],
-                         dot_keys, tol, diffs)
+                         dot_keys, tol, diffs,
+                         sort_keys=dot_sort_keys)
 
     # trimmed_dots
     for mol in range(2):
         _check_dict_list(f'trimmed_dots[{mol}]',
                          current.trimmed_dots[mol], golden.trimmed_dots[mol],
-                         dot_keys, tol, diffs)
+                         dot_keys, tol, diffs,
+                         sort_keys=dot_sort_keys)
 
     # probes
     _check_dict_list(
