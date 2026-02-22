@@ -535,6 +535,24 @@ class DotArray:
         self.atom_idx[i] = atom_idx
         self._n += 1
 
+    def extend(self, coor_x, coor_y, coor_z,
+               outnml_x, outnml_y, outnml_z,
+               area, buried, type_, atom_idx):
+        """Batch-append n dots in a single slice assignment."""
+        n = len(coor_x)
+        if n == 0:
+            return
+        while self._n + n > self._cap:
+            self._grow()
+        i = self._n
+        self.coor_x[i:i+n]   = coor_x;   self.coor_y[i:i+n]   = coor_y;   self.coor_z[i:i+n]   = coor_z
+        self.outnml_x[i:i+n] = outnml_x; self.outnml_y[i:i+n] = outnml_y; self.outnml_z[i:i+n] = outnml_z
+        self.area[i:i+n]     = area
+        self.buried[i:i+n]   = buried
+        self.type_[i:i+n]    = type_
+        self.atom_idx[i:i+n] = atom_idx
+        self._n += n
+
     def __len__(self):   return self._n
     def __bool__(self):  return self._n > 0
 
@@ -1752,16 +1770,14 @@ class MolecularSurfaceCalculator:
 
         self.run.results.dots.convex += points_keep.shape[0]
 
-        for p, pc, ai, li in zip(points_keep, pcen_keep, atom_keep, lat_keep):
-
-            self.add_dot(
-                atoms.molecule[ai],
-                1,
-                Vec3.from_xyz(p),
-                area[ai, li],
-                Vec3.from_xyz(pc),
-                atoms[ai]
-            )
+        self.add_dots(
+            atoms.molecule[atom_keep],
+            1,
+            points_keep,
+            area[atom_keep, lat_keep],
+            pcen_keep,
+            atoms.natom[atom_keep],
+        )
 
         return 1
 
@@ -1946,10 +1962,12 @@ class MolecularSurfaceCalculator:
             areas = ps[:,None] * ts[atom_idx[mask1],None] * dist / rij[atom_idx[mask1],None]
             valid = ~np.isnan(areas)
 
-            for point, area, atom1_, atom2_, pij_ in zip(points[valid], areas[valid], atom1[atom_idx][mask1][valid], atom2[atom_idx][mask1][valid], expanded_pij[valid]):
-                self.run.results.dots.toroidal += 1
-                self.add_dot(atom1_.molecule, 2,
-                                 Vec3.from_xyz(point), area, Vec3.from_xyz(pij_), atom1_)
+            K = int(valid.sum())
+            self.run.results.dots.toroidal += K
+            if K > 0:
+                mol = np.broadcast_to(atom1.molecule[atom_idx][mask1][:, None], valid.shape)[valid]
+                nat = np.broadcast_to(atom1.natom[atom_idx][mask1][:, None],    valid.shape)[valid]
+                self.add_dots(mol, 2, points[valid], areas[valid], expanded_pij[valid], nat)
 
             # areas_total += np.sum(valid)
 
@@ -1977,10 +1995,12 @@ class MolecularSurfaceCalculator:
             areas = ps[:,None] * ts[atom_idx[mask2],None] * dist / rij[atom_idx[mask2],None]
             valid = ~np.isnan(areas)
 
-            for point, area, atom1_, atom2_, pij_ in zip(points[valid], areas[valid], atom1[atom_idx][mask2][valid], atom2[atom_idx][mask2][valid], expanded_pij[valid]):
-                self.run.results.dots.toroidal += 1
-                self.add_dot(atom1_.molecule, 2,
-                                 Vec3.from_xyz(point), area, Vec3.from_xyz(pij_), atom2_)
+            K = int(valid.sum())
+            self.run.results.dots.toroidal += K
+            if K > 0:
+                mol = np.broadcast_to(atom1.molecule[atom_idx][mask2][:, None], valid.shape)[valid]
+                nat = np.broadcast_to(atom2.natom[atom_idx][mask2][:, None],    valid.shape)[valid]
+                self.add_dots(mol, 2, points[valid], areas[valid], expanded_pij[valid], nat)
             # areas_total += np.sum(valid)
 
         # self.run.results.dots.toroidal += areas_total
@@ -2185,16 +2205,15 @@ class MolecularSurfaceCalculator:
 
         self.run.results.dots.concave += pts.shape[0]
 
-        for p, ip, il, imc in zip(pts, idx_probe, idx_lat, mc):
-
-            self.add_dot(
-                atom_molecule[ip,imc],
-                3,
-                Vec3.from_xyz(p),
-                area[ip, il],
-                Vec3.from_xyz(pijk[ip]),
-                atom_arrays[imc][ip]
-            )
+        atom_natom_stack = np.stack(atom_natom, axis=1)   # (P, 3)
+        self.add_dots(
+            atom_molecule[idx_probe, mc],
+            3,
+            pts,
+            area[idx_probe, idx_lat],
+            pijk[idx_probe],
+            atom_natom_stack[idx_probe, mc],
+        )
 
         return 1
 
@@ -2240,6 +2259,53 @@ class MolecularSurfaceCalculator:
         return collided_points
 
 
+
+    def add_dots(self, molecule, type_, coor, area, pcen, atom_indices):
+        """
+        Vectorised batch version of add_dot.
+
+        molecule     : (N,) int   — 0 or 1
+        type_        : int scalar — 1=convex, 2=toroidal, 3=concave
+        coor         : (N, 3)    — surface dot coordinates
+        area         : (N,)      — area per dot
+        pcen         : (N, 3)    — probe / atom centre (for normal and burial)
+        atom_indices : (N,) int  — index into self.run.atoms (== natom == _idx)
+        """
+        N = len(coor)
+        if N == 0:
+            return
+
+        pradius      = self.settings.rp
+        atom_indices = np.asarray(atom_indices, dtype=np.int32)
+        molecule     = np.asarray(molecule,     dtype=np.int8)
+
+        # ── outward normal ────────────────────────────────────────────────
+        if pradius <= 0:
+            outnml = coor - self.run.atoms.xyz[atom_indices]   # (N, 3)
+        else:
+            outnml = (pcen - coor) / pradius                    # (N, 3)
+
+        # ── buried determination ──────────────────────────────────────────
+        bxyz   = self.run.buried_array.xyz[atom_indices]        # (N, max_b, 3)
+        brad   = self.run.buried_array.radius[atom_indices]     # (N, max_b)
+        d2     = np.square(bxyz - pcen[:, None, :]).sum(axis=-1)  # (N, max_b)
+        buried = (d2 <= (brad + pradius) ** 2).any(axis=-1).astype(np.int8)  # (N,)
+
+        # regression-test trackers (preserve last values, matching loop behaviour)
+        self.run.prevp      = Vec3.from_xyz(pcen[-1])
+        self.run.prevburied = bool(buried[-1])
+
+        # ── partition by molecule and batch-append ────────────────────────
+        type_arr = np.full(N, type_, dtype=np.int8)
+        for mol in (0, 1):
+            mask = molecule == mol
+            if not mask.any():
+                continue
+            self.run.dots[mol].extend(
+                coor[mask, 0], coor[mask, 1], coor[mask, 2],
+                outnml[mask, 0], outnml[mask, 1], outnml[mask, 2],
+                area[mask], buried[mask], type_arr[mask], atom_indices[mask],
+            )
 
     def add_dot(
         self,
