@@ -137,24 +137,6 @@ class RESULTS:
         self.valid = 0
 
 
-class DOT:
-    def __init__(self, coor=None, area=None, atom=None, dot_type=None):
-        self.coor = coor
-        self.outnml = Vec3()
-        self.area = area
-        self.buried = 0
-        self.type = dot_type
-        self.atom = atom
-
-
-class PROBE:
-    def __init__(self):
-        self.pAtoms = [None, None, None]
-        self.height = 0.0
-        self.point = Vec3()
-        self.alt = Vec3()
-
-
 from pyrosetta import rosetta
 from pyrosetta import *
 from pyrosetta.rosetta import *
@@ -646,7 +628,7 @@ class ProbeArray:
 
         self._cap = new_cap
 
-    def append(self, atom_idx_0, atom_idx_1, atom_idx_2, height, point, alt):
+    def append(self, atom_idx_0, atom_idx_1, atom_idx_2, height, point_xyz, alt_xyz):
         """point and alt are Vec3 (or anything with .x_, .y_, .z_)."""
         if self._n >= self._cap:
             self._grow()
@@ -655,8 +637,8 @@ class ProbeArray:
         self.atom_idx_1[i] = atom_idx_1
         self.atom_idx_2[i] = atom_idx_2
         self.height[i]     = height
-        self.point_xyz[i] = [point.x_, point.y_, point.z_] 
-        self.alt_xyz[i]   = [alt.x_, alt.y_, alt.z_] 
+        self.point_xyz[i] = point_xyz
+        self.alt_xyz[i]   = alt_xyz
         self._n += 1
         view = ProbeView(self, self._atom_arr, i)
         self._views[i] = view
@@ -738,11 +720,8 @@ class MolecularSurfaceCalculator:
         self.run.dots       = [DotArray(), DotArray()]
         self.run.trimmed_dots = [DotArray(), DotArray()]
         self.run.probes     = ProbeArray(self.run.atoms)
-        self.run.prevp      = Vec3()
-        self.run.prevburied = 0
         self.run.neighbor_array = None
         self.run.buried_array = None
-        self.run.convex_queue = []
         self.run.toroid_queue = []
 
 
@@ -1107,9 +1086,9 @@ class MolecularSurfaceCalculator:
         convex_mask = (access
                        & (atten > ATTEN_BLOCKER)
                        & ~((atten == ATTEN_6) & (n_buried == 0)))
-        self.run.convex_queue = list(good_indices[convex_mask])
+        convex_queue = list(good_indices[convex_mask])
 
-        self.generate_convex_surface(self.run.atoms[self.run.convex_queue])
+        self.generate_convex_surface(self.run.atoms[convex_queue])
 
         self.generate_toroidal_surfaces()
 
@@ -1523,8 +1502,8 @@ class MolecularSurfaceCalculator:
                 int(probe_a1_f[i]),
                 int(probe_a2_f[i]),
                 float(hijk_f[i]),
-                Vec3.from_xyz(pijk_f[i]),
-                Vec3.from_xyz(alt_f[i]),
+                pijk_f[i],
+                alt_f[i],
             )
 
         # ── return natoms that gained access ─────────────────────────────
@@ -2209,10 +2188,6 @@ class MolecularSurfaceCalculator:
         brad   = self.run.buried_array.radius[atom_indices]     # (N, max_b)
         d2     = np.square(bxyz - pcen[:, None, :]).sum(axis=-1)  # (N, max_b)
         buried = (d2 <= (brad + pradius) ** 2).any(axis=-1).astype(np.int8)  # (N,)
-
-        # regression-test trackers (preserve last values, matching loop behaviour)
-        self.run.prevp      = Vec3.from_xyz(pcen[-1])
-        self.run.prevburied = bool(buried[-1])
 
         # ── partition by molecule and batch-append ────────────────────────
         type_arr = np.full(N, type_, dtype=np.int8)

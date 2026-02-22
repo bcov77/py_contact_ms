@@ -50,7 +50,6 @@ class TestCalculatorRun:
         # ── top-level scalars ──────────────────────────────────────────────
         self.cms        = cms_value
         self.radmax     = run.radmax
-        self.prevburied = run.prevburied
 
         # ── results ───────────────────────────────────────────────────────
         r = run.results
@@ -230,7 +229,6 @@ def compare_runs(current, golden, tol=TOLERANCE):
     # top-level scalars
     _check_scalar('cms',        current.cms,        golden.cms,        tol, diffs)
     _check_scalar('radmax',     current.radmax,     golden.radmax,     tol, diffs)
-    _check_scalar('prevburied', current.prevburied, golden.prevburied, tol, diffs)
 
     # results dict
     all_keys = sorted(set(golden.results) | set(current.results))
