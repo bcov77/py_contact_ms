@@ -1205,73 +1205,88 @@ class MolecularSurfaceCalculator:
 
     def second_loop(self, atom1):
 
-        neighbors = atom1.neighbors
+        na1    = atom1.natom
+        nneigh = int(self.run.neighbor_array.nneighbors[na1])
 
-        eri = atom1.radius + self.settings.rp
+        if nneigh == 0:
+            return 1
 
-        # Pairs to be dispatched to vec_third_loop at the end.
-        tl_a1_idx = []
-        tl_a2_idx = []
-        tl_uij    = []
-        tl_tij    = []
-        tl_rij    = []
+        # ── pull neighbour data from the pre-built array ──────────────────
+        neigh_xyz   = self.run.neighbor_array.xyz[na1,   :nneigh]   # (K, 3)
+        neigh_rad   = self.run.neighbor_array.radius[na1, :nneigh]  # (K,)
+        neigh_natom = self.run.neighbor_array.natom[na1,  :nneigh]  # (K,)
 
-        for atom2 in neighbors:
+        # ── ordering guard: only pairs where natom2 > natom1 ─────────────
+        fwd = neigh_natom > na1                                      # (K,)
+        if not np.any(fwd):
+            return 1
 
-            if atom2 <= atom1:
-                continue
+        v_xyz   = neigh_xyz[fwd]    # (K', 3)
+        v_rad   = neigh_rad[fwd]    # (K',)
+        v_natom = neigh_natom[fwd]  # (K',)
 
-            erj = atom2.radius + self.settings.rp
-            dij = atom1.distance(atom2)
+        # ── geometry for all forward pairs ────────────────────────────────
+        a1_xyz = self.run.atoms.xyz[na1]            # (3,)
+        eri    = atom1.radius + self.settings.rp    # scalar
 
-            uij = (atom2 - atom1) / dij
-            asymm = (eri * eri - erj * erj) / dij
-            between = abs(asymm) < dij
+        erj     = v_rad + self.settings.rp          # (K',)
+        diff    = v_xyz - a1_xyz[None, :]           # (K', 3)
+        dij     = np.linalg.norm(diff, axis=-1)     # (K',)
+        uij     = diff / dij[:, None]               # (K', 3)
 
-            tij = ((atom1 + atom2) * 0.5) + (uij * (asymm * 0.5))
+        asymm   = (eri**2 - erj**2) / dij           # (K',)
+        between = np.abs(asymm) < dij               # (K',)
+        tij     = (a1_xyz[None, :] + v_xyz) * 0.5 + uij * (asymm * 0.5)[:, None]  # (K', 3)
 
-            _far_ = (eri + erj) ** 2 - dij * dij
-            if _far_ <= 0.0:
-                continue
+        far_sq  = (eri + erj)**2 - dij**2           # (K',)
+        cont_sq = dij**2 - (atom1.radius - v_rad)**2  # (K',)
 
-            _far_ = math.sqrt(_far_)
+        geom_ok = (far_sq > 0.0) & (cont_sq > 0.0)  # (K',)
+        if not np.any(geom_ok):
+            return 1
 
-            contain = dij * dij - (atom1.radius - atom2.radius) ** 2
-            if contain <= 0.0:
-                continue
+        uij_f     = uij[geom_ok]                    # (K'', 3)
+        tij_f     = tij[geom_ok]                    # (K'', 3)
+        rij_f     = (0.5 * np.sqrt(far_sq[geom_ok])
+                        * np.sqrt(cont_sq[geom_ok])
+                        / dij[geom_ok])             # (K'',)
+        v_natom_f = v_natom[geom_ok]                # (K'',)
+        between_f = between[geom_ok]                # (K'',)
+        Kpp       = int(uij_f.shape[0])
 
-            contain = math.sqrt(contain)
-            rij = 0.5 * _far_ * contain / dij
+        # ── single-neighbour shortcut (mirrors `len(neighbors) <= 1`) ────
+        if nneigh <= 1:
+            atom1.access = 1
+            self.run.atoms.access[v_natom_f[0]] = 1
+            return 1
 
-            if len(neighbors) <= 1:
-                atom1.access = 1
-                atom2.access = 1
-                break
+        # ── toroid queue ──────────────────────────────────────────────────
+        v_atten_f   = self.run.atoms.atten[v_natom_f]  # (K'',)
+        need_toroid = (
+            (atom1.atten > ATTEN_BLOCKER) |
+            ((v_atten_f > ATTEN_BLOCKER) & (self.settings.rp > 0.0))
+        )
+        for i in np.where(need_toroid)[0]:
+            self.run.toroid_queue.append((
+                na1,
+                int(v_natom_f[i]),
+                uij_f[i],
+                tij_f[i],
+                float(rij_f[i]),
+                bool(between_f[i]),
+            ))
 
-            # Queue this pair for the batched third-loop pass.
-            tl_a1_idx.append(atom1.natom)
-            tl_a2_idx.append(atom2.natom)
-            tl_uij.append(uij.to_numpy())
-            tl_tij.append(tij.to_numpy())
-            tl_rij.append(rij)
-
-            if (
-                atom1.atten > ATTEN_BLOCKER or
-                (atom2.atten > ATTEN_BLOCKER and self.settings.rp > 0.0)
-            ):
-                self.run.toroid_queue.append((atom1.natom, atom2.natom, uij.to_numpy(), tij.to_numpy(), rij, between))
-
-        # ── dispatch all collected pairs to vec_third_loop ────────────────
-        if tl_a1_idx:
-            access_natoms = self.vec_third_loop(
-                self.run.atoms[np.array(tl_a1_idx, dtype=np.int32)],
-                self.run.atoms[np.array(tl_a2_idx, dtype=np.int32)],
-                np.array(tl_uij, dtype=np.float64),
-                np.array(tl_tij, dtype=np.float64),
-                np.array(tl_rij, dtype=np.float64),
-            )
-            if len(access_natoms):
-                self.run.atoms.access[access_natoms] = 1
+        # ── vec_third_loop ────────────────────────────────────────────────
+        na1_arr       = np.full(Kpp, na1, dtype=np.int32)
+        access_natoms = self.vec_third_loop(
+            self.run.atoms[na1_arr],
+            self.run.atoms[v_natom_f.astype(np.int32)],
+            uij_f,
+            tij_f,
+            rij_f,
+        )
+        if len(access_natoms):
+            self.run.atoms.access[access_natoms] = 1
 
         return 1
 
