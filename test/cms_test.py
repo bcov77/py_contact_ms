@@ -101,8 +101,8 @@ class TestCalculatorRun:
                 'x':           float(a.xyz[i,0]),
                 'y':           float(a.xyz[i,1]),
                 'z':           float(a.xyz[i,2]),
-                'n_neighbors': len(a[i].neighbors),
-                'n_buried':    len(a[i].buried),
+                'n_neighbors': int(calc.run.neighbor_array.nneighbors[i]),
+                'n_buried':    int(calc.run.buried_array.nneighbors[i]),
             }
             for i in range(n)
         ]

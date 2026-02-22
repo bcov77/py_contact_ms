@@ -1075,17 +1075,7 @@ class MolecularSurfaceCalculator:
                 self.run.radmax = atom.radius
 
 
-        good_atom = np.zeros(len(self.run.atoms), dtype=bool)
-        for iatom, atom1 in enumerate(self.run.atoms):
-            if atom1.atten <= 0:
-                continue
-            if not self.find_neighbors_for_atom(atom1):
-                continue
-            atom1.neighbors.sort(key=lambda a: atom1.distance(a))
-            good_atom[iatom] = True
-
-
-        self.generate_neighbor_array()
+        good_atom = self.build_neighbor_arrays()
 
 
         # Generate convex surfaces
@@ -1095,7 +1085,7 @@ class MolecularSurfaceCalculator:
 
             self.second_loop(atom1)
 
-            if not len(atom1.neighbors):
+            if not self.run.neighbor_array.nneighbors[atom1.natom]:
                 continue
 
             # if not self.find_neighbors_and_buried_atoms(atom1):
@@ -1107,7 +1097,7 @@ class MolecularSurfaceCalculator:
             if atom1.atten <= ATTEN_BLOCKER:
                 continue
 
-            if atom1.atten == ATTEN_6 and not atom1.buried:
+            if atom1.atten == ATTEN_6 and not self.run.buried_array.nneighbors[atom1.natom]:
                 continue
 
             self.run.convex_queue.append(iatom)
@@ -1140,6 +1130,106 @@ class MolecularSurfaceCalculator:
         self.run.atoms.access[natoms1] |= atom1_has_access
         self.run.atoms.access[natoms2] |= atom2_has_access
 
+
+    def build_neighbor_arrays(self):
+        """
+        Vectorised replacement for the find_neighbors_for_atom loop +
+        generate_neighbor_array.  Computes all-pairs squared distances once
+        with cdist, derives neighbor / buried masks with numpy broadcasting,
+        then fills neighbor_array and buried_array in a single O(N) Python
+        pass with per-atom numpy indexing.
+
+        Returns
+        -------
+        good_atom : bool ndarray, shape (N,)
+        """
+        atoms  = self.run.atoms
+        N      = len(atoms)
+        rp     = self.settings.rp
+
+        xyz    = atoms.xyz[:N]       # (N, 3)
+        radius = atoms.radius[:N]    # (N,)
+        mol    = atoms.molecule[:N]  # (N,)
+        atten  = atoms.atten[:N]     # (N,)
+        natom  = atoms.natom[:N]     # (N,)
+
+        # ── all-pairs squared distances ───────────────────────────────────
+        d2 = cdist(xyz, xyz, metric='sqeuclidean')  # (N, N)
+
+        # ── bridge threshold matrix ───────────────────────────────────────
+        r_sum   = radius[:, None] + radius[None, :]   # (N, N)
+        bridge2 = (r_sum + 2.0 * rp) ** 2             # (N, N)
+
+        # ── boolean context masks ─────────────────────────────────────────
+        active      = atten > 0                        # (N,)
+        same_mol    = mol[:, None] == mol[None, :]     # (N, N)
+        same_mol_off = same_mol & ~np.eye(N, dtype=bool)  # exclude self
+
+        # ── coincident atoms check ────────────────────────────────────────
+        coincident = same_mol_off & active[:, None] & active[None, :] & (d2 <= 0.0001)
+        if coincident.any():
+            i0, j0 = map(int, np.argwhere(coincident)[0])
+            raise RuntimeError(
+                f"Coincident atoms: "
+                f"{natom[i0]}:{atoms.residue_name[i0]}:{atoms.atom_name[i0]} == "
+                f"{natom[j0]}:{atoms.residue_name[j0]}:{atoms.atom_name[j0]}"
+            )
+
+        # ── neighbor mask (same molecule, within bridge) ──────────────────
+        neighbor_mask = active[:, None] & active[None, :] & same_mol_off & (d2 < bridge2)
+
+        # ── cross-molecule masks ──────────────────────────────────────────
+        diff_mol        = ~same_mol                        # (N, N); diag=False
+        buried_eligible = atten >= ATTEN_BURIED_FLAGGED    # (N,)
+
+        buried_mask = active[:, None] & buried_eligible[None, :] & diff_mol & (d2 < bridge2)
+
+        # nbb: cross-mol, buried-eligible, within bb2
+        bb2      = (4.0 * self.run.radmax + 4.0 * rp) ** 2
+        nbb_mask = active[:, None] & buried_eligible[None, :] & diff_mol & (d2 < bb2)
+        nbb      = nbb_mask.sum(axis=1)                    # (N,)
+
+        # ── good_atom and access ──────────────────────────────────────────
+        n_neighbors   = neighbor_mask.sum(axis=1)          # (N,)
+        atten6_no_nbb = (atten == ATTEN_6) & (nbb == 0)
+
+        # access = 1 when active, not blocked by atten6_no_nbb, but no neighbors
+        new_access = active & ~atten6_no_nbb & (n_neighbors == 0)
+        atoms.access[:N] |= new_access.astype(np.int8)
+
+        good_atom = active & ~atten6_no_nbb & (n_neighbors > 0)  # (N,)
+
+        # ── build neighbor_array ──────────────────────────────────────────
+        max_n = int(n_neighbors.max()) if n_neighbors.any() else 1
+        neighbor_array = SimpleNeighborArray(N, max_n)
+
+        n_buried = buried_mask.sum(axis=1)                 # (N,)
+        max_b = int(n_buried.max()) if n_buried.any() else 1
+        buried_array = SimpleNeighborArray(N, max_b)
+
+        for i in np.where(active)[0]:
+            # neighbors sorted by ascending distance
+            nidx = np.where(neighbor_mask[i])[0]
+            if len(nidx):
+                nidx = nidx[np.argsort(d2[i, nidx])]
+                n = len(nidx)
+                neighbor_array.xyz[i, :n]    = xyz[nidx]
+                neighbor_array.radius[i, :n] = radius[nidx]
+                neighbor_array.natom[i, :n]  = natom[nidx]
+                neighbor_array.nneighbors[i] = n
+
+            # buried (order doesn't matter)
+            bidx = np.where(buried_mask[i])[0]
+            if len(bidx):
+                n = len(bidx)
+                buried_array.xyz[i, :n]    = xyz[bidx]
+                buried_array.radius[i, :n] = radius[bidx]
+                buried_array.natom[i, :n]  = natom[bidx]
+                buried_array.nneighbors[i] = n
+
+        self.run.neighbor_array = neighbor_array
+        self.run.buried_array   = buried_array
+        return good_atom
 
     import math
 
