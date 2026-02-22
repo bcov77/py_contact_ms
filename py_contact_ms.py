@@ -399,6 +399,7 @@ class AtomArray:
         self.residue_name[i]= atom.residue
         self._n += 1
         view = AtomView(self, i)
+        assert view._idx == view.natom
         self._views[i] = view
         return view
 
@@ -471,6 +472,7 @@ class AtomArray:
             if idx in self._views:
                 new._views[iidx] = self._views[idx]
 
+        new.finalize()
         return new
 
     def __iter__(self):
@@ -481,6 +483,7 @@ class AtomArray:
         """Trim all arrays to [0:n].  Call once after all appends are done."""
         for f in self._FLOAT_FIELDS + self._INT8_FIELDS + self._INT32_FIELDS:
             setattr(self, f, getattr(self, f)[:self._n].copy())
+        self.xyz    = self.xyz[:self._n]
         self.atom_name    = self.atom_name[:self._n]
         self.residue_name = self.residue_name[:self._n]
 
@@ -557,16 +560,12 @@ class ProbeView:
     @property
     def point(self):
         i = self._idx
-        return Vec3(float(self._arr.point_x[i]),
-                    float(self._arr.point_y[i]),
-                    float(self._arr.point_z[i]))
+        return Vec3.from_xyz(self._arr.point_xyz[i])
 
     @property
     def alt(self):
         i = self._idx
-        return Vec3(float(self._arr.alt_x[i]),
-                    float(self._arr.alt_y[i]),
-                    float(self._arr.alt_z[i]))
+        return Vec3.from_xyz(self._arr.alt_xyz[i])
 
     @property
     def pAtoms(self):
@@ -596,24 +595,37 @@ class ProbeArray:
         self._atom_arr = atom_arr
 
         for f in ('height',
-                  'point_x', 'point_y', 'point_z',
-                  'alt_x',   'alt_y',   'alt_z'):
+                  # 'point_x', 'point_y', 'point_z',
+                  # 'alt_x',   'alt_y',   'alt_z'
+                  ):
             setattr(self, f, np.zeros(cap, dtype=np.float64))
         for f in ('atom_idx_0', 'atom_idx_1', 'atom_idx_2'):
             setattr(self, f, np.zeros(cap, dtype=np.int32))
+
+        self.point_xyz = np.zeros((cap, 3), dtype=np.float64)
+        self.alt_xyz = np.zeros((cap, 3), dtype=np.float64)
 
         self._views: dict = {}
 
     def _grow(self):
         new_cap = self._cap * 2
         for f in ('height',
-                  'point_x', 'point_y', 'point_z',
-                  'alt_x',   'alt_y',   'alt_z',
+                  # 'point_x', 'point_y', 'point_z',
+                  # 'alt_x',   'alt_y',   'alt_z',
                   'atom_idx_0', 'atom_idx_1', 'atom_idx_2'):
             old = getattr(self, f)
             new = np.zeros(new_cap, dtype=old.dtype)
             new[:self._n] = old[:self._n]
             setattr(self, f, new)
+
+        point_xyz_old = self.point_xyz
+        self.point_xyz = np.zeros((new_cap, 3), dtype=np.float64)
+        self.point_xyz[:self._n] = point_xyz_old[:self._n]
+
+        alt_xyz_old = self.xyz
+        self.alt_xyz = np.zeros((new_cap, 3), dtype=np.float64)
+        self.alt_xyz[:self._n] = alt_xyz_old[:self._n]
+
         self._cap = new_cap
 
     def append(self, atom_idx_0, atom_idx_1, atom_idx_2, height, point, alt):
@@ -625,8 +637,8 @@ class ProbeArray:
         self.atom_idx_1[i] = atom_idx_1
         self.atom_idx_2[i] = atom_idx_2
         self.height[i]     = height
-        self.point_x[i]    = point.x_; self.point_y[i] = point.y_; self.point_z[i] = point.z_
-        self.alt_x[i]      = alt.x_;   self.alt_y[i]   = alt.y_;   self.alt_z[i]   = alt.z_
+        self.point_xyz[i] = [point.x_, point.y_, point.z_] 
+        self.alt_xyz[i]   = [alt.x_, alt.y_, alt.z_] 
         self._n += 1
         view = ProbeView(self, self._atom_arr, i)
         self._views[i] = view
@@ -646,8 +658,8 @@ class ProbeArray:
 
     def finalize(self):
         for f in ('height',
-                  'point_x', 'point_y', 'point_z',
-                  'alt_x',   'alt_y',   'alt_z',
+                  'point_xyz',
+                  'alt_xyz', 
                   'atom_idx_0', 'atom_idx_1', 'atom_idx_2'):
             setattr(self, f, getattr(self, f)[:self._n].copy())
 
@@ -1098,6 +1110,7 @@ class MolecularSurfaceCalculator:
 
             self.generate_convex_surface(self.run.atoms[iatom:iatom+1])
 
+        self.run.probes.finalize()
         # Concave surface
         if self.settings.rp > 0:
             self.generate_concave_surface()
@@ -1720,152 +1733,257 @@ class MolecularSurfaceCalculator:
 
     def generate_concave_surface(self):
 
-        lowprobs = []
-        nears = []
 
-        # collect low probes
-        for probe in self.run.probes:
-            if probe.height < self.settings.rp:
-                lowprobs.append(probe)
+        probes = self.run.probes
+        if not probes:
+            return 1
 
-        for probe in self.run.probes:
+        rp = self.settings.rp
+        rp2 = rp * rp
 
-            if (
-                probe.pAtoms[0].atten == ATTEN_6 and
-                probe.pAtoms[1].atten == ATTEN_6 and
-                probe.pAtoms[2].atten == ATTEN_6
-            ):
-                continue
+        # ---------------------------------------------------------
+        # Pull probe data into arrays
+        # ---------------------------------------------------------
 
-            pijk = probe.point
-            uijk = probe.alt
-            hijk = probe.height
+        P = len(probes)
 
-            density = (
-                probe.pAtoms[0].density +
-                probe.pAtoms[1].density +
-                probe.pAtoms[2].density
-            ) / 3.0
+        pijk = probes.point_xyz #np.array([p.point.to_numpy() for p in probes])        # (P,3)
+        uijk = probes.alt_xyz #np.array([p.alt.to_numpy() for p in probes])          # (P,3)
+        hijk = probes.height #np.array([p.height for p in probes])                  # (P,)
 
-            # gather nearby low probes
-            nears.clear()
-            for lprobe in lowprobs:
-                if probe is lprobe:
-                    continue
-                d2 = pijk.distance_squared(lprobe.point)
-                if d2 <= 4 * (self.settings.rp ** 2):
-                    nears.append(lprobe)
+        atom_natom = [probes.atom_idx_0, probes.atom_idx_1, probes.atom_idx_2]
+        atom_arrays = [self.run.atoms[natom] for natom in atom_natom]
 
-            # vectors to atoms
-            vp = []
-            for i in range(3):
-                v = probe.pAtoms[i] - pijk
-                v.normalize()
-                vp.append(v)
+        atom_xyz = np.stack([arr.xyz for arr in atom_arrays], axis=1)
+        atom_radius = np.stack([arr.radius for arr in atom_arrays], axis=-1)
+        atom_density = np.stack([arr.density for arr in atom_arrays], axis=-1)
+        atom_atten = np.stack([arr.atten for arr in atom_arrays], axis=-1)
+        atom_molecule = np.stack([arr.molecule for arr in atom_arrays], axis=-1)
 
-            vectors = [
-                vp[0].cross(vp[1]),
-                vp[1].cross(vp[2]),
-                vp[2].cross(vp[0])
-            ]
-            for v in vectors:
-                v.normalize()
 
-            # highest vertex
-            dm = -1.0
-            mm = 0
-            for i in range(3):
-                dt = uijk.dot(vp[i])
-                if dt > dm:
-                    dm = dt
-                    mm = i
+        density = atom_density.mean(axis=1)  # (P,)
 
-            south = -uijk
-            axis = vp[mm].cross(south)
-            axis.normalize()
+        # ---------------------------------------------------------
+        # Identify low probes
+        # ---------------------------------------------------------
 
-            lats = []
-            o = Vec3(0, 0, 0)
+        low_mask = hijk < rp
+        low_points = pijk[low_mask]
 
-            cs = self.sub_arc(o, self.settings.rp,
-                              axis, density,
-                              vp[mm], south, lats)
+        # ---------------------------------------------------------
+        # Skip fully attenuated probes
+        # ---------------------------------------------------------
 
-            if not lats:
-                continue
+        skip = np.all(atom_atten == ATTEN_6, axis=1)
+        active = ~skip
 
-            for ilat in lats:
+        if not np.any(active):
+            return 1
 
-                dt = ilat.dot(south)
-                cen = south * dt
+        # ---------------------------------------------------------
+        # Nearby low probes (vectorized distance)
+        # ---------------------------------------------------------
 
-                rad = self.settings.rp**2 - dt**2
-                if rad <= 0.0:
-                    continue
-                rad = math.sqrt(rad)
+        nears_mask = None
+        if np.any(low_mask):
 
-                points = []
-                ps = self.sub_cir(cen, rad, south,
-                                  density, points)
+            d2 = np.sum(
+                (pijk[:,None,:] - low_points[None,:,:])**2,
+                axis=-1
+            )  # (P, L)
 
-                if not points:
-                    continue
+            # nears_mask = d2 <= 4 * rp2
 
-                area = ps * cs
+            low_indices = np.where(low_mask)[0]          # (L,) original probe indices
+            nears_mask = d2 <= 4 * rp2
+            nears_mask[low_indices, np.arange(len(low_indices))] = False  # exclude self
 
-                for point in points:
+        # ---------------------------------------------------------
+        # Vectors from probe to atoms
+        # ---------------------------------------------------------
 
-                    bail = False
-                    for vector in vectors:
-                        if point.dot(vector) >= 0.0:
-                            bail = True
-                            break
-                    if bail:
-                        continue
+        vp = atom_xyz - pijk[:,None,:]
+        vp /= np.linalg.norm(vp, axis=-1, keepdims=True)
 
-                    point = point + pijk
+        vectors = np.stack([
+            np.cross(vp[:,0], vp[:,1]),
+            np.cross(vp[:,1], vp[:,2]),
+            np.cross(vp[:,2], vp[:,0])
+        ], axis=1)
 
-                    if (
-                        hijk < self.settings.rp and
-                        nears and
-                        self.check_probe_collision(
-                            point, nears,
-                            self.settings.rp**2
-                        )
-                    ):
-                        continue
+        vectors /= np.linalg.norm(vectors, axis=-1, keepdims=True)
 
-                    # find closest atom
-                    mc = 0
-                    dmin = 2 * self.settings.rp
-                    for i in range(3):
-                        d = (
-                            point.distance(probe.pAtoms[i]) -
-                            probe.pAtoms[i].radius
-                        )
-                        if d < dmin:
-                            dmin = d
-                            mc = i
+        # ---------------------------------------------------------
+        # Highest vertex
+        # ---------------------------------------------------------
 
-                    self.run.results.dots.concave += 1
-                    self.add_dot(
-                        probe.pAtoms[mc].molecule,
-                        3,
-                        point,
-                        area,
-                        pijk,
-                        probe.pAtoms[mc]
-                    )
+        dt = np.sum(uijk[:,None,:] * vp, axis=-1)   # (P,3)
+        mm = np.argmax(dt, axis=1)
+
+        south = -uijk
+
+        axis = np.cross(
+            vp[np.arange(P), mm],
+            south
+        )
+        axis /= np.linalg.norm(axis, axis=-1, keepdims=True)
+
+        # ---------------------------------------------------------
+        # Latitude arcs (batched)
+        # ---------------------------------------------------------
+
+        o = np.zeros_like(pijk)
+
+        cs, lats = self.vec_sub_arc(
+            o,
+            np.full(P, rp),
+            axis,
+            density,
+            vp[np.arange(P), mm],
+            south
+        )
+
+        valid_lat = ~np.isnan(lats[...,0])
+
+        # ---------------------------------------------------------
+        # Circle subdivisions
+        # ---------------------------------------------------------
+
+        dt_lat = np.sum(lats * south[:,None,:], axis=-1)
+        cen = south[:,None,:] * dt_lat[...,None]
+
+        rad_sq = rp2 - dt_lat**2
+        valid_rad = rad_sq > 0
+        rad = np.sqrt(np.clip(rad_sq, 0, None))
+
+        ps, points = self.vec_sub_cir(
+            cen.reshape(-1,3),
+            rad.reshape(-1),
+            np.repeat(south, lats.shape[1], axis=0),
+            np.repeat(density, lats.shape[1])
+        )
+
+        points = points.reshape(P, -1, points.shape[-2], 3)
+        ps = ps.reshape(P, -1)
+
+        valid_points = ~np.isnan(points[...,0])
+
+        area = ps * cs[:,None]
+
+        # ---------------------------------------------------------
+        # Flatten all valid geometry
+        # ---------------------------------------------------------
+
+        idx_probe, idx_lat, idx_pt = np.where(valid_points)
+        pts = points[idx_probe, idx_lat, idx_pt]
+        cen_flat = pijk[idx_probe]
+
+        # Vector rejection test
+        vecs = vectors[idx_probe]
+        bail = np.any(
+            np.sum(pts[:,None,:] * vecs, axis=-1) >= 0,
+            axis=1
+        )
+
+        pts = pts[~bail]
+        idx_probe = idx_probe[~bail]
+        idx_lat = idx_lat[~bail]
+
+        pts = pts + cen_flat[~bail]
+
+        # ---------------------------------------------------------
+        # Low-probe collision
+        # ---------------------------------------------------------
+
+        if nears_mask is not None:
+
+            near_any = nears_mask[idx_probe].any(axis=1)
+
+            coll = self.check_probe_collision_vectorized(
+                pts,
+                low_points,
+                nears_mask[idx_probe],
+                rp2
+            )
+
+            reject = (hijk[idx_probe] < rp) & near_any & coll
+
+            pts = pts[~reject]
+            idx_probe = idx_probe[~reject]
+            idx_lat = idx_lat[~reject]
+
+        # ---------------------------------------------------------
+        # Closest atom selection
+        # ---------------------------------------------------------
+
+        d = np.linalg.norm(
+            pts[:,None,:] - atom_xyz[idx_probe],
+            axis=-1
+        ) - atom_radius[idx_probe]
+
+        mc = np.argmin(d, axis=1)
+
+        # ---------------------------------------------------------
+        # Final dot creation
+        # ---------------------------------------------------------
+
+        self.run.results.dots.concave += pts.shape[0]
+
+        for p, ip, il, imc in zip(pts, idx_probe, idx_lat, mc):
+
+            self.add_dot(
+                atom_molecule[ip,imc],
+                3,
+                Vec3.from_xyz(p),
+                area[ip, il],
+                Vec3.from_xyz(pijk[ip]),
+                atom_arrays[imc][ip]
+            )
 
         return 1
 
-    def check_probe_collision(self, point, nears, r2):
 
-        for near in nears:
-            if point.distance_squared(near.point) < r2:
-                return 1
+    def check_probe_collision_vectorized(
+        self,
+        points,        # (N,3)
+        near_points,   # (M,3)
+        near_mask,     # (N,M) bool
+        r2             # scalar
+        ):
+        """
+        Returns (N,) boolean array.
+        True if point i collides with ANY allowed near_point.
+        """
 
-        return 0
+        N = points.shape[0]
+
+        # Find only valid (i,j) pairs
+        rows, cols = np.where(near_mask)
+
+        if rows.size == 0:
+            return np.zeros(N, dtype=bool)
+
+        # Gather only those coordinates
+        p_sel = points[rows]        # (K,3)
+        q_sel = near_points[cols]   # (K,3)
+
+        # Compute squared distances only for valid pairs
+        diff = p_sel - q_sel
+        d2 = np.einsum("ij,ij->i", diff, diff)  # fast rowwise dot
+
+        # Determine which pairs collide
+        colliding_pairs = d2 < r2
+
+        if not np.any(colliding_pairs):
+            return np.zeros(N, dtype=bool)
+
+        # Mark which points had at least one collision
+        collided_points = np.zeros(N, dtype=bool)
+        collided_points[rows[colliding_pairs]] = True
+
+        return collided_points
+
+
 
     def add_dot(
         self,

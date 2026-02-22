@@ -154,12 +154,12 @@ class TestCalculatorRun:
                                  int(p.atom_idx_1[i]),
                                  int(p.atom_idx_2[i])],
                 'height':  float(p.height[i]),
-                'point_x': float(p.point_x[i]),
-                'point_y': float(p.point_y[i]),
-                'point_z': float(p.point_z[i]),
-                'alt_x':   float(p.alt_x[i]),
-                'alt_y':   float(p.alt_y[i]),
-                'alt_z':   float(p.alt_z[i]),
+                'point_x': float(p.point_xyz[i,0]),
+                'point_y': float(p.point_xyz[i,1]),
+                'point_z': float(p.point_xyz[i,2]),
+                'alt_x':   float(p.alt_xyz[i,0]),
+                'alt_y':   float(p.alt_xyz[i,1]),
+                'alt_z':   float(p.alt_xyz[i,2]),
             }
             for i in range(np_)
         ]
