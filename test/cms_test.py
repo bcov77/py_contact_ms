@@ -20,8 +20,10 @@ os.chdir(_ROOT_DIR)
 sys.path.insert(0, _ROOT_DIR)
 
 # Importing py_contact_ms initialises PyRosetta at module level
-from py_contact_ms import MolecularSurfaceCalculator
+from py_contact_ms import partition_pose, calculate_contact_ms
 from pyrosetta import pose_from_file
+from pyrosetta import init
+init('-mute all')
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -281,11 +283,8 @@ def run_test():
     pose = pose_from_file(TEST_PDB)
 
     # 2. Run calculator
-    calc = MolecularSurfaceCalculator()
-    xyz_0, radii_0, xyz_1, radii_1 = calc.partition_pose(pose)
-    calc.AddMolecule(0, xyz_0, radii_0)
-    calc.AddMolecule(1, xyz_1, radii_1)
-    cms = calc.CalcLoaded()
+    binder_xyz, binder_radii, target_xyz, target_radii = partition_pose(pose)
+    cms, per_atom_cms, calc = calculate_contact_ms(binder_xyz, binder_radii, target_xyz, target_radii, return_calc=True)
     print(f"CMS value: {cms:.6f}")
 
     # 3. Snapshot run state

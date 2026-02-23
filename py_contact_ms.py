@@ -2,10 +2,100 @@
 import math
 
 import sys
-sys.path.append('/home/bcov/sc/random/npose')
-import npose_util as nu
 import numpy as np
 from scipy.spatial.distance import cdist
+
+
+def calculate_contact_ms(binder_xyz, binder_radii, target_xyz, target_radii, return_calc=False):
+    '''
+    Main entrypoint into the code
+
+    Calculate contact molecular surface of your binder against the target
+
+    Contact molecular surface has units of A^2 and is a distance weighted surface area of your target
+
+    Do not provide your own radii, you need to use the very specific radii raturned from get_radii_from_names()
+
+    Parameters
+    -------
+    binder_xyz   : np.ndarray (N0, 3)
+    binder_radii : np.ndarray (N0,)
+    target_xyz   : np.ndarray (N1, 3)
+    target_radii : np.ndarray (N1,)
+    return_calc  : bool
+
+
+    Returns
+    -------
+    cms                 : float -- The contact molecular surface
+    per_atom_target_cms : np.ndarray shape (N1,) — The per-atom contact_ms of your target molecule
+    '''
+
+    calc = MolecularSurfaceCalculator()
+    calc.add_binder_and_target(binder_xyz, binder_radii, target_xyz, target_radii)
+    cms, per_atom_target_cms = calc.CalcLoaded()
+
+    if return_calc:
+        return cms, per_atom_target_cms, calc
+    else:
+        return cms, per_atom_target_cms
+
+
+def get_radii_from_names(res_names, atom_names):
+    """
+    Look up radii for parallel lists of residue names and atom names.
+
+    Residue and atom names should be stripped (So 'N' instead of ' N  ')
+
+    Parameters
+    ----------
+    res_names  : list[str]  length N
+    atom_names : list[str]  length N
+
+    Returns
+    -------
+    radii : np.ndarray shape (N,) — 0.0 for any unmatched atom
+    """
+    radii_ = read_sc_radii()
+    radii = np.zeros(len(res_names), dtype=np.float64)
+    for i, (res, atom) in enumerate(zip(res_names, atom_names)):
+        for radius_obj in radii_:
+            if not wildcard_match(res, radius_obj.residue, len(res) + 2):
+                continue
+            if not wildcard_match(atom, radius_obj.atom, len(atom) + 2):
+                continue
+            radii[i] = radius_obj.radius
+            break
+    return radii
+
+
+def partition_pose(pose, jump_id=1):
+    """
+    If for some reason you are calling these functions with a pyrosetta pose...
+
+    Partition a pose by jump and return xyz and radii arrays for each molecule.
+
+    Calls extract_atom_data_from_pose to get per-atom residue/atom names and
+    coordinates, then get_radii_from_names to look up radii.  Atoms with no
+    matching radius (radius == 0) are filtered out.
+
+    Returns
+    -------
+    xyz_0   : np.ndarray (N0, 3)
+    radii_0 : np.ndarray (N0,)
+    xyz_1   : np.ndarray (N1, 3)
+    radii_1 : np.ndarray (N1,)
+    """
+    rn0, an0, xyz_0, rn1, an1, xyz_1 = extract_atom_data_from_pose(pose, jump_id)
+
+    radii_0 = get_radii_from_names(rn0, an0)
+    radii_1 = get_radii_from_names(rn1, an1)
+
+    mask_0 = radii_0 > 0
+    mask_1 = radii_1 > 0
+
+    return xyz_0[mask_0], radii_0[mask_0], xyz_1[mask_1], radii_1[mask_1]
+
 
 
 SC_RADII_LIB = '''
@@ -141,11 +231,6 @@ class RESULTS:
         self.dots = ResultsDots()
         self.valid = 0
 
-
-from pyrosetta import rosetta
-from pyrosetta import *
-from pyrosetta.rosetta import *
-init('-mute all')
 
 class AtomArray:
     """
@@ -470,6 +555,7 @@ def extract_atom_data_from_pose(pose, jump_id=1):
     atom_names_1 : list[str]
     xyz_1        : np.ndarray (N1,3)
     """
+    from pyrosetta import rosetta
     if jump_id > pose.num_jump():
         raise ValueError("Jump ID out of bounds")
 
@@ -512,9 +598,86 @@ def extract_atom_data_from_pose(pose, jump_id=1):
             res_names[1], atom_names[1], xyz_arrays[1])
 
 
-class MolecularSurfaceCalculator:
+def read_sc_radii():
+    """
+    Read side-chain radii definitions.
+
+    Returns:
+        1 if radii were successfully read (non-empty)
+        0 otherwise
+    """
 
     radii = []
+
+    for line in SC_RADII_LIB.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+
+        residue, atom, radius_value = parts[0], parts[1], parts[2]
+
+        try:
+            radius_float = float(radius_value)
+        except ValueError:
+            continue
+
+        if residue and atom and radius_float > 0:
+
+            # Create ATOM_RADIUS-like object
+            radius_obj = type("ATOM_RADIUS", (), {})()
+            radius_obj.residue = residue
+            radius_obj.atom = atom
+            radius_obj.radius = radius_float
+
+            radii.append(radius_obj)
+
+    return radii
+
+
+def wildcard_match(query: str, pattern: str, l: int):
+    """
+    Inline residue and atom name matching.
+    Mirrors C++ logic exactly.
+    """
+
+    qi = 0
+    pi = 0
+
+    while True:
+        l -= 1
+        if l <= 0:
+            break
+
+        q = query[qi] if qi < len(query) else '\0'
+        p = pattern[pi] if pi < len(pattern) else '\0'
+
+        match = (
+            (q == p) or
+            (q != '\0' and p == '*') or
+            (q == ' ' and p == '\0')
+        )
+
+        if not match:
+            return 0
+
+        # Allow anything following a * in pattern
+        if p == '*' and (pi + 1 >= len(pattern) or pattern[pi + 1] == '\0'):
+            return 1
+
+        if q != '\0':
+            qi += 1
+        if p != '\0':
+            pi += 1
+
+    return 1
+
+
+
+class MolecularSurfaceCalculator:
 
     def __init__(self):
 
@@ -528,8 +691,6 @@ class MolecularSurfaceCalculator:
         self.settings.binwidth_norm = 0.02
 
         self.reset()
-
-        self.read_sc_radii()
 
     def reset(self):
         self.run = type("Run", (), {})()
@@ -570,49 +731,10 @@ class MolecularSurfaceCalculator:
         self.calc_dots_for_all_atoms(self.run.atoms)
 
 
-    def read_sc_radii(self):
-        """
-        Read side-chain radii definitions.
-
-        Returns:
-            1 if radii were successfully read (non-empty)
-            0 otherwise
-        """
-
-        self.radii_ = []
-
-        for line in SC_RADII_LIB.split('\n'):
-            line = line.strip()
-            if not line:
-                continue
-
-            parts = line.split()
-            if len(parts) < 3:
-                continue
-
-            residue, atom, radius_value = parts[0], parts[1], parts[2]
-
-            try:
-                radius_float = float(radius_value)
-            except ValueError:
-                continue
-
-            if residue and atom and radius_float > 0:
-                if getattr(self, "trace_visible", False):
-                    print(f"Atom Radius: {residue}:{atom} = {radius_float}")
-
-                # Create ATOM_RADIUS-like object
-                radius_obj = type("ATOM_RADIUS", (), {})()
-                radius_obj.residue = residue
-                radius_obj.atom = atom
-                radius_obj.radius = radius_float
-
-                self.radii_.append(radius_obj)
-
-        if getattr(self, "trace_visible", False):
-            print(f"Atom radii read: {len(self.radii_)}")
-
-        return 1 if self.radii_ else 0
+    def add_binder_and_target(self, binder_xyz, binder_radii, target_xyz, target_radii):
+        self.reset()
+        self.AddMolecule(0, binder_xyz, binder_radii)
+        self.AddMolecule(1, target_xyz, target_radii)
 
     def AddMolecule(self, molecule, xyz, radii):
         """
@@ -634,108 +756,7 @@ class MolecularSurfaceCalculator:
         self.run.results.surface[mol_val].nAtoms += n
         self.run.results.nAtoms += n
 
-    def assign_atom_radius(self, atom):
-        """
-        Assign atom radius using wildcard matching.
-        Returns 1 if assigned, 0 otherwise.
-        """
 
-        for radius in self.radii_:
-            if not self.wildcard_match(atom.residue, radius.residue, len(atom.residue)+2):
-                continue
-            if not self.wildcard_match(atom.atom, radius.atom, len(atom.atom)+2):
-                continue
-
-            atom.radius = radius.radius
-            return 1
-
-        return 0
-
-    def wildcard_match(self, query: str, pattern: str, l: int):
-        """
-        Inline residue and atom name matching.
-        Mirrors C++ logic exactly.
-        """
-
-        qi = 0
-        pi = 0
-
-        while True:
-            l -= 1
-            if l <= 0:
-                break
-
-            q = query[qi] if qi < len(query) else '\0'
-            p = pattern[pi] if pi < len(pattern) else '\0'
-
-            match = (
-                (q == p) or
-                (q != '\0' and p == '*') or
-                (q == ' ' and p == '\0')
-            )
-
-            if not match:
-                return 0
-
-            # Allow anything following a * in pattern
-            if p == '*' and (pi + 1 >= len(pattern) or pattern[pi + 1] == '\0'):
-                return 1
-
-            if q != '\0':
-                qi += 1
-            if p != '\0':
-                pi += 1
-
-        return 1
-
-    def get_radii_from_names(self, res_names, atom_names):
-        """
-        Look up radii for parallel lists of residue names and atom names.
-
-        Parameters
-        ----------
-        res_names  : list[str]  length N
-        atom_names : list[str]  length N
-
-        Returns
-        -------
-        radii : np.ndarray shape (N,) — 0.0 for any unmatched atom
-        """
-        radii = np.zeros(len(res_names), dtype=np.float64)
-        for i, (res, atom) in enumerate(zip(res_names, atom_names)):
-            for radius_obj in self.radii_:
-                if not self.wildcard_match(res, radius_obj.residue, len(res) + 2):
-                    continue
-                if not self.wildcard_match(atom, radius_obj.atom, len(atom) + 2):
-                    continue
-                radii[i] = radius_obj.radius
-                break
-        return radii
-
-    def partition_pose(self, pose, jump_id=1):
-        """
-        Partition a pose by jump and return xyz and radii arrays for each molecule.
-
-        Calls extract_atom_data_from_pose to get per-atom residue/atom names and
-        coordinates, then get_radii_from_names to look up radii.  Atoms with no
-        matching radius (radius == 0) are filtered out.
-
-        Returns
-        -------
-        xyz_0   : np.ndarray (N0, 3)
-        radii_0 : np.ndarray (N0,)
-        xyz_1   : np.ndarray (N1, 3)
-        radii_1 : np.ndarray (N1,)
-        """
-        rn0, an0, xyz_0, rn1, an1, xyz_1 = extract_atom_data_from_pose(pose, jump_id)
-
-        radii_0 = self.get_radii_from_names(rn0, an0)
-        radii_1 = self.get_radii_from_names(rn1, an1)
-
-        mask_0 = radii_0 > 0
-        mask_1 = radii_1 > 0
-
-        return xyz_0[mask_0], radii_0[mask_0], xyz_1[mask_1], radii_1[mask_1]
 
     def calc_contact_molecular_surface(self, dots0, dots1):
         """
@@ -761,7 +782,9 @@ class MolecularSurfaceCalculator:
         dist_sq      = cdist(xyz0_b, xyz1_b, metric='sqeuclidean')  # (K0, K1)
         min_dist_sq  = dist_sq.min(axis=1)                           # (K0,)
 
-        return float((area0_b * np.exp(-min_dist_sq * self.settings.weight)).sum())
+        per_atom_target_cms = area0_b * np.exp(-min_dist_sq * self.settings.weight)
+        total_cms = float((per_atom_target_cms.sum()).sum())
+        return total_cms, per_atom_target_cms
 
 
     def assign_attention_numbers(self, atoms, all_atoms=False):
@@ -2142,19 +2165,19 @@ class MolecularSurfaceCalculator:
 if __name__ == '__main__':
 
     import sys
+    from pyrosetta import rosetta
+    from pyrosetta import *
+    from pyrosetta.rosetta import *
+    init('-mute all')
 
     pdb = sys.argv[1]
 
     pose = pose_from_file(pdb)
 
-    calc = MolecularSurfaceCalculator()
-    xyz_0, radii_0, xyz_1, radii_1 = calc.partition_pose(pose)
-    calc.AddMolecule(0, xyz_0, radii_0)
-    calc.AddMolecule(1, xyz_1, radii_1)
-    cms = calc.CalcLoaded()
+    binder_xyz, binder_radii, target_xyz, target_radii= partition_pose(pose)
+    cms, per_atom_cms, calc = calculate_contact_ms(binder_xyz, binder_radii, target_xyz, target_radii, return_calc=True)
 
     print(cms)
-
 
 
     d0    = calc.run.dots[0]
@@ -2162,8 +2185,5 @@ if __name__ == '__main__':
 
     d1    = calc.run.dots[1]
     dots1 = d1.coor_xyz
-
-    # pr    = calc.run.probes
-    # probes = np.column_stack([pr.point_x, pr.point_y, pr.point_z]) if len(pr) else np.empty((0, 3))
 
 
