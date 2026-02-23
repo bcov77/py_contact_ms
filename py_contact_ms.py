@@ -1358,11 +1358,11 @@ class MolecularSurfaceCalculator:
             south
         )
 
-        # lats: (N, MAX_SUBDIV, 3)
+        # lats: (N, K, 3)  K <= MAX_SUBDIV
         valid_lats = ~np.isnan(lats[...,0])
 
         # dt per atom per latitude
-        dt = np.sum(lats * north[:,None,:], axis=-1)  # (N, M)
+        dt = np.sum(lats * north[:,None,:], axis=-1)  # (N, K)
 
         cen = atoms.xyz[:,None,:] + dt[...,None] * north[:,None,:]
 
@@ -1373,18 +1373,33 @@ class MolecularSurfaceCalculator:
         rad[valid_rad] = np.sqrt(rad_sq[valid_rad])
 
         # ---------------------------------------------------------
-        # Generate ALL circle points in one call
+        # Generate ALL circle points, skipping zero-radius rows
         # ---------------------------------------------------------
 
-        ps, points = self.vec_sub_cir(
-            cen.reshape(-1,3),
-            rad.reshape(-1),
-            np.repeat(north, lats.shape[1], axis=0),
-            np.repeat(atoms.density, lats.shape[1])
-        )
+        M            = lats.shape[1]
+        flat_rad     = rad.reshape(-1)
+        flat_cen     = cen.reshape(-1, 3)
+        flat_north   = np.repeat(north, M, axis=0)
+        flat_density = np.repeat(atoms.density, M)
+        active       = flat_rad > 0
 
-        points = points.reshape(N, -1, points.shape[-2], 3)
-        ps = ps.reshape(N, -1)
+        if active.any():
+            ps_a, pts_a      = self.vec_sub_cir(
+                flat_cen[active], flat_rad[active],
+                flat_north[active], flat_density[active]
+            )
+            K                = pts_a.shape[1]
+            full_pts         = np.full((N * M, K, 3), np.nan)
+            full_pts[active] = pts_a
+            full_ps          = np.zeros(N * M)
+            full_ps[active]  = ps_a
+        else:
+            K        = 0
+            full_pts = np.empty((N * M, 0, 3))
+            full_ps  = np.zeros(N * M)
+
+        points = full_pts.reshape(N, M, K, 3)
+        ps     = full_ps.reshape(N, M)
 
         valid_points = ~np.isnan(points[...,0])
 
@@ -1785,15 +1800,30 @@ class MolecularSurfaceCalculator:
         valid_rad = rad_sq > 0
         rad = np.sqrt(np.clip(rad_sq, 0, None))
 
-        ps, points = self.vec_sub_cir(
-            cen.reshape(-1,3),
-            rad.reshape(-1),
-            np.repeat(south, lats.shape[1], axis=0),
-            np.repeat(density, lats.shape[1])
-        )
+        M              = lats.shape[1]
+        flat_rad       = rad.reshape(-1)
+        flat_cen       = cen.reshape(-1, 3)
+        flat_south     = np.repeat(south, M, axis=0)
+        flat_density_r = np.repeat(density, M)
+        active         = flat_rad > 0
 
-        points = points.reshape(P, -1, points.shape[-2], 3)
-        ps = ps.reshape(P, -1)
+        if active.any():
+            ps_a, pts_a      = self.vec_sub_cir(
+                flat_cen[active], flat_rad[active],
+                flat_south[active], flat_density_r[active]
+            )
+            K                = pts_a.shape[1]
+            full_pts         = np.full((P * M, K, 3), np.nan)
+            full_pts[active] = pts_a
+            full_ps          = np.zeros(P * M)
+            full_ps[active]  = ps_a
+        else:
+            K        = 0
+            full_pts = np.empty((P * M, 0, 3))
+            full_ps  = np.zeros(P * M)
+
+        points = full_pts.reshape(P, M, K, 3)
+        ps     = full_ps.reshape(P, M)
 
         valid_points = ~np.isnan(points[...,0])
 
@@ -1990,7 +2020,7 @@ class MolecularSurfaceCalculator:
         rad, density: (...)
         Returns:
             ps: (...)
-            points: (..., MAX_SUBDIV, 3)
+            points: (..., K, 3)  where K <= MAX_SUBDIV
         """
 
         # y = axis × x
@@ -2010,25 +2040,34 @@ class MolecularSurfaceCalculator:
         """
         cen, x, y: (..., 3)
         rad, angle, density: (...)
-        
+
         Returns:
             ps: (...)
-            points: (..., MAX_SUBDIV, 3)
+            points: (..., K, 3)  where K = min(MAX_SUBDIV, max subdivisions needed)
         """
 
-        rad = np.asarray(rad)
+        rad     = np.asarray(rad)
         density = np.asarray(density)
-        angle = np.asarray(angle)
+        angle   = np.asarray(angle)
 
-        # Angular spacing
-        delta = 1.0 / (np.sqrt(density) * rad)
-
-        # Shape helpers
         base_shape = rad.shape
-        full_shape = base_shape + (MAX_SUBDIV,)
 
-        # Generate all candidate subdivision indices
-        i = np.arange(MAX_SUBDIV)
+        # Angular spacing — guard div-by-zero; invalid elements produce inf/nan
+        with np.errstate(divide='ignore', invalid='ignore'):
+            delta = 1.0 / (np.sqrt(density) * rad)
+            raw   = angle / delta          # exact subdivisions needed per element
+
+        # Trim the inner dimension to only as many slots as the worst-case element
+        # needs, rather than always allocating MAX_SUBDIV=100.
+        valid_raw = np.isfinite(raw) & (raw > 0)
+        if not valid_raw.any():
+            return np.zeros(base_shape), np.full(base_shape + (0, 3), np.nan)
+
+        max_count = int(min(MAX_SUBDIV, math.ceil(float(raw[valid_raw].max()))))
+        if max_count == 0:
+            return np.zeros(base_shape), np.full(base_shape + (0, 3), np.nan)
+
+        i = np.arange(max_count)
 
         # a_i = delta*(i + 1/2)
         a = delta[..., None] * (i + 0.5)
@@ -2042,18 +2081,16 @@ class MolecularSurfaceCalculator:
 
         # Expand vectors
         cen_exp = cen[..., None, :]
-        x_exp = x[..., None, :]
-        y_exp = y[..., None, :]
+        x_exp   = x[..., None, :]
+        y_exp   = y[..., None, :]
 
         points = cen_exp + x_exp * c[..., None] + y_exp * s[..., None]
 
         # Apply mask → nan where invalid
         points = np.where(mask[..., None], points, np.nan)
 
-        # Count valid points
+        # Count valid points per element; ps = arc_length / count
         counts = np.sum(mask, axis=-1)
-
-        # ps = rad * angle / count
         ps = np.where(counts > 0, rad * angle / counts, 0.0)
 
         return ps, points
