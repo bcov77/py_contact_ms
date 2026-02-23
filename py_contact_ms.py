@@ -7,78 +7,6 @@ import npose_util as nu
 import numpy as np
 from scipy.spatial.distance import cdist
 
-class Vec3:
-    def __init__(self, x=0.0, y=0.0, z=0.0):
-        self.x_ = float(x)
-        self.y_ = float(y)
-        self.z_ = float(z)
-
-    @staticmethod
-    def from_xyz(xyz):
-        return Vec3(xyz[0], xyz[1], xyz[2])
-
-    def x(self, value=None):
-        if value is None:
-            return self.x_
-        self.x_ = float(value)
-
-    def y(self, value=None):
-        if value is None:
-            return self.y_
-        self.y_ = float(value)
-
-    def z(self, value=None):
-        if value is None:
-            return self.z_
-        self.z_ = float(value)
-
-    def __add__(self, other):
-        return Vec3(self.x_ + other.x_, self.y_ + other.y_, self.z_ + other.z_)
-
-    def __sub__(self, other):
-        return Vec3(self.x_ - other.x_, self.y_ - other.y_, self.z_ - other.z_)
-
-    def __mul__(self, scalar):
-        return Vec3(self.x_ * scalar, self.y_ * scalar, self.z_ * scalar)
-
-    def __neg__(self):
-        return Vec3(-self.x_, -self.y_, -self.z_)
-
-    def __truediv__(self, scalar):
-        return Vec3(self.x_ / scalar, self.y_ / scalar, self.z_ / scalar)
-
-    def dot(self, other):
-        return self.x_ * other.x_ + self.y_ * other.y_ + self.z_ * other.z_
-
-    def cross(self, other):
-        return Vec3(
-            self.y_ * other.z_ - self.z_ * other.y_,
-            self.z_ * other.x_ - self.x_ * other.z_,
-            self.x_ * other.y_ - self.y_ * other.x_
-        )
-
-    def magnitude_squared(self):
-        return self.dot(self)
-
-    def magnitude(self):
-        return math.sqrt(self.magnitude_squared())
-
-    def normalize(self):
-        mag = self.magnitude()
-        if mag > 0:
-            self.x_ /= mag
-            self.y_ /= mag
-            self.z_ /= mag
-
-    def distance(self, other):
-        return (self - other).magnitude()
-
-    def distance_squared(self, other):
-        return (self - other).magnitude_squared()
-
-    def to_numpy(self):
-        return np.array([self.x_, self.y_, self.z_])
-
 
 class ResultsSurface:
     def __init__(self):
@@ -119,23 +47,6 @@ from pyrosetta import rosetta
 from pyrosetta import *
 from pyrosetta.rosetta import *
 init('-mute all')
-
-
-# ── Struct-of-Arrays containers ───────────────────────────────────────────────
-#
-# AtomArray / AtomView  – drop-in replacement for list[Atom]
-# DotArray              – replaces list[DOT]  (no view class needed)
-# ProbeArray / ProbeView – replaces list[PROBE]
-#
-# Design goals
-#   • All numeric data lives in pre-allocated numpy arrays (SoA layout).
-#   • AtomView / ProbeView are *cached* proxy objects: atoms[i] always returns
-#     the same Python object, so "atom1 is atom2" identity checks remain valid.
-#   • The three-loop surface algorithm continues to work unmodified because
-#     AtomView exposes the same attribute / method interface as the old Atom
-#     class (x_, y_, z_, atten, neighbors, …).
-#   • Vectorised callers (assign_attention_numbers, calc_contact_molecular_
-#     surface) operate directly on the numpy arrays for O(N²) → numpy speed.
 
 class AtomArray:
     """
@@ -825,36 +736,6 @@ class MolecularSurfaceCalculator:
         self.run.results.surface[1].nBuriedAtoms  += int((~blocker1).sum())
 
         return 1
-
-    def generate_neighbor_array(self):
-        max_neighbors = 0
-        for atom in self.run.atoms:
-            max_neighbors = max(max_neighbors, len(atom.neighbors))
-
-        self.run.neighbor_array = SimpleNeighborArray(len(self.run.atoms), max_neighbors)
-        for iatom, atom in enumerate(self.run.atoms):
-            n = len(atom.neighbors)
-            self.run.neighbor_array.xyz[iatom, :n, 0] = [x.x_ for x in atom.neighbors]
-            self.run.neighbor_array.xyz[iatom, :n, 1] = [x.y_ for x in atom.neighbors]
-            self.run.neighbor_array.xyz[iatom, :n, 2] = [x.z_ for x in atom.neighbors]
-            self.run.neighbor_array.radius[iatom, :n] = [x.radius for x in atom.neighbors]
-            self.run.neighbor_array.natom[iatom, :n] = [x.natom for x in atom.neighbors]
-            self.run.neighbor_array.nneighbors[iatom] = n
-
-
-        max_burieds = 0
-        for atom in self.run.atoms:
-            max_burieds = max(max_burieds, len(atom.buried))
-
-        self.run.buried_array = SimpleNeighborArray(len(self.run.atoms), max_burieds)
-        for iatom, atom in enumerate(self.run.atoms):
-            n = len(atom.buried)
-            self.run.buried_array.xyz[iatom, :n, 0] = [x.x_ for x in atom.buried]
-            self.run.buried_array.xyz[iatom, :n, 1] = [x.y_ for x in atom.buried]
-            self.run.buried_array.xyz[iatom, :n, 2] = [x.z_ for x in atom.buried]
-            self.run.buried_array.radius[iatom, :n] = [x.radius for x in atom.buried]
-            self.run.buried_array.natom[iatom, :n] = [x.natom for x in atom.buried]
-            self.run.buried_array.nneighbors[iatom] = n
 
     def calc_dots_for_all_atoms(self, _atoms_unused):
         """
@@ -2131,86 +2012,6 @@ class MolecularSurfaceCalculator:
         angle = np.full_like(rad, 2*np.pi)
 
         return self.vec_sub_div(cen, rad, x, y, angle, density)
-
-    def sub_arc(
-        self,
-        cen,
-        rad,
-        axis,
-        density,
-        x,
-        v,
-        points
-    ):
-
-        y = axis.cross(x)
-
-        dt1 = v.dot(x)
-        dt2 = v.dot(y)
-
-        # bcov addition
-        if np.isclose(dt1, 0) and np.isclose(dt2, 0):
-            return 0
-
-        angle = math.atan2(dt2, dt1)
-
-        if angle < 0.0:
-            angle += 2 * math.pi
-
-        return self.sub_div(
-            cen,
-            rad,
-            x,
-            y,
-            angle,
-            density,
-            points
-        )
-
-    def sub_div(self, cen, rad, x, y, angle, density, points):
-        """
-        Subdivide a circular arc and generate surface points.
-        Returns arc length per subdivision (angular step).
-        """
-
-        delta = 1.0 / (math.sqrt(density) * rad)
-        a = - delta / 2
-        for i in range(MAX_SUBDIV):
-            a = a + delta
-            if a > angle:
-                break
-            c = rad * math.cos(a)
-            s = rad * math.sin(a)
-            points.append(cen + x*c + y*s)
-
-        if len(points) > 0:
-            ps = rad * angle / len(points)
-        else:
-            ps = 0
-
-        return ps
-
-    def sub_cir(self, cen, rad, axis, density, points):
-        """
-        Generate points on a full circle perpendicular to 'north'.
-        Returns angular subdivision step.
-        """
-
-        v1 = Vec3(axis.y_**2 + axis.z_**2, axis.x_**2 + axis.z_**2, axis.x_**2 + axis.y_**2)
-        v1.normalize()
-        dt = v1.dot(axis)
-
-        if abs(dt) > 0.99:
-            v1 = Vec3(1.0, 0.0, 0.0)
-        v2 = axis.cross(v1)
-        v2.normalize()
-        x = axis.cross(v2)
-        x.normalize()
-        y = axis.cross(x)
-
-        return self.sub_div(cen, rad, x, y, 2*PI, density, points)
-
-
 
 if __name__ == '__main__':
 
