@@ -5,6 +5,14 @@ import sys
 import numpy as np
 from scipy.spatial.distance import cdist
 
+'''
+API Notes:
+
+The only two functions you really need to call are get_radii_from_names() and calculate_contact_ms() 
+
+'''
+
+
 
 def calculate_contact_ms(binder_xyz, binder_radii, target_xyz, target_radii, return_calc=False):
     '''
