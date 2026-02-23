@@ -693,6 +693,62 @@ MAX_SUBDIV = 100
 PI = math.pi
 
 
+def extract_atom_data_from_pose(pose, jump_id=1):
+    """
+    Extract per-atom residue names, atom names, and xyz coordinates from a
+    PyRosetta pose, partitioned by jump into two molecules.
+
+    Returns
+    -------
+    res_names_0  : list[str]         residue 3-letter names for molecule 0
+    atom_names_0 : list[str]         stripped atom names for molecule 0
+    xyz_0        : np.ndarray (N0,3) coordinates for molecule 0
+    res_names_1  : list[str]
+    atom_names_1 : list[str]
+    xyz_1        : np.ndarray (N1,3)
+    """
+    if jump_id > pose.num_jump():
+        raise ValueError("Jump ID out of bounds")
+
+    is_upstream = rosetta.utility.vector1_bool(pose.size())
+    if jump_id > 0:
+        is_upstream = pose.fold_tree().partition_by_jump(jump_id)
+    else:
+        for i in range(1, pose.size() + 1):
+            is_upstream[i] = True
+
+    res_names  = [[], []]
+    atom_names = [[], []]
+    xyzs       = [[], []]
+
+    for i in range(1, pose.size() + 1):
+        residue = pose.residue(i)
+
+        if residue.type().name() == "VRT":
+            continue
+        if residue.type().is_metal():
+            continue
+
+        mol = 0 if is_upstream[i] else 1
+
+        for j in range(1, residue.nheavyatoms() + 1):
+            if residue.is_virtual(j):
+                continue
+
+            xyz = residue.xyz(j)
+            res_names[mol].append(residue.name3())
+            atom_names[mol].append(residue.atom_name(j).strip())
+            xyzs[mol].append([xyz.x, xyz.y, xyz.z])
+
+    xyz_arrays = [
+        np.array(xyzs[m], dtype=np.float64).reshape(-1, 3)
+        for m in range(2)
+    ]
+
+    return (res_names[0], atom_names[0], xyz_arrays[0],
+            res_names[1], atom_names[1], xyz_arrays[1])
+
+
 class MolecularSurfaceCalculator:
 
     radii = []
@@ -724,37 +780,6 @@ class MolecularSurfaceCalculator:
         self.run.buried_array = None
         self.run.toroid_queue = []
 
-
-    def calc(self, pose, jump_id=1):
-
-        if jump_id > pose.num_jump():
-            raise ValueError("Jump ID out of bounds")
-
-        is_upstream = rosetta.utility.vector1_bool(pose.size())
-        # is_upstream.resize(pose.size())
-
-        if jump_id > 0:
-            is_upstream = pose.fold_tree().partition_by_jump(jump_id)
-        else:
-            for i in range(1, pose.size()+1):
-                is_upstream[i] = True
-
-        for i in range(1, pose.size()+1):
-
-
-            residue = pose.residue(i)
-
-            if residue.type().name() == "VRT":
-                continue
-
-            if residue.type().is_metal():
-                continue
-
-            mol = 0 if is_upstream[i] else 1
-            self.add_residue(mol, residue)
-
-        return self.CalcLoaded()
-
     def CalcLoaded(self):
         self.run.results.valid = 0
         assert len(self.run.atoms) > 0
@@ -781,43 +806,6 @@ class MolecularSurfaceCalculator:
 
         self.calc_dots_for_all_atoms(self.run.atoms)
 
-
-    def add_residue(self, molecule, residue, apolar_only=False):
-
-        scatoms = []
-
-        for i in range(1, residue.nheavyatoms()+1):
-
-            if residue.is_virtual(i):
-                continue
-
-            if residue.type().is_metal():
-                continue
-
-            if apolar_only:
-                if residue.atom_type(i).is_acceptor() or residue.atom_type(i).is_donor():
-                    continue
-
-            atom = Atom()
-            xyz = residue.xyz(i)
-
-            atom.x(xyz.x)
-            atom.y(xyz.y)
-            atom.z(xyz.z)
-
-            atom.nresidue = residue.seqpos()
-            atom.residue = residue.name3()
-            atom.atom = residue.atom_name(i).strip()
-
-            if not self.assign_atom_radius(atom):
-                return 0
-
-            scatoms.append(atom)
-
-        for atom in scatoms:
-            self.add_atom(molecule, atom)
-
-        return len(scatoms)
 
     def read_sc_radii(self, filename="sc_radii.lib"):
         """
@@ -876,27 +864,34 @@ class MolecularSurfaceCalculator:
 
         return 1 if self.radii_ else 0
 
+    def AddMolecule(self, molecule, xyz, radii):
+        """
+        Load atoms for one molecule from numpy arrays.
 
-    def add_atom(self, molecule, atom):
-
-        if atom.radius <= 0:
-            self.assign_atom_radius(atom)
-
-        if atom.radius > 0:
-            atom.density  = self.settings.density
-            atom.molecule = 1 if molecule == 1 else 0
-            atom.natom    = len(self.run.atoms)
-            atom.access   = 0
-
-            self.run.atoms.append(atom)  # copies into AtomArray, returns AtomView (unused here)
-            self.run.results.surface[atom.molecule].nAtoms += 1
+        Parameters
+        ----------
+        molecule : int          0 or 1
+        xyz      : np.ndarray   shape (N, 3) — atom coordinates
+        radii    : np.ndarray   shape (N,)   — atom radii; atoms with radius
+                                               <= 0 are skipped
+        """
+        mol_val = 1 if molecule == 1 else 0
+        for i in range(len(radii)):
+            r = float(radii[i])
+            if r <= 0:
+                continue
+            atom = Atom()
+            atom.x_      = float(xyz[i, 0])
+            atom.y_      = float(xyz[i, 1])
+            atom.z_      = float(xyz[i, 2])
+            atom.radius  = r
+            atom.density = self.settings.density
+            atom.molecule = mol_val
+            atom.natom   = len(self.run.atoms)
+            atom.access  = 0
+            self.run.atoms.append(atom)
+            self.run.results.surface[mol_val].nAtoms += 1
             self.run.results.nAtoms += 1
-
-            return 1
-
-        return 0
-
-
 
     def assign_atom_radius(self, atom):
         """
@@ -951,6 +946,55 @@ class MolecularSurfaceCalculator:
                 pi += 1
 
         return 1
+
+    def get_radii_from_names(self, res_names, atom_names):
+        """
+        Look up radii for parallel lists of residue names and atom names.
+
+        Parameters
+        ----------
+        res_names  : list[str]  length N
+        atom_names : list[str]  length N
+
+        Returns
+        -------
+        radii : np.ndarray shape (N,) — 0.0 for any unmatched atom
+        """
+        radii = np.zeros(len(res_names), dtype=np.float64)
+        for i, (res, atom) in enumerate(zip(res_names, atom_names)):
+            for radius_obj in self.radii_:
+                if not self.wildcard_match(res, radius_obj.residue, len(res) + 2):
+                    continue
+                if not self.wildcard_match(atom, radius_obj.atom, len(atom) + 2):
+                    continue
+                radii[i] = radius_obj.radius
+                break
+        return radii
+
+    def partition_pose(self, pose, jump_id=1):
+        """
+        Partition a pose by jump and return xyz and radii arrays for each molecule.
+
+        Calls extract_atom_data_from_pose to get per-atom residue/atom names and
+        coordinates, then get_radii_from_names to look up radii.  Atoms with no
+        matching radius (radius == 0) are filtered out.
+
+        Returns
+        -------
+        xyz_0   : np.ndarray (N0, 3)
+        radii_0 : np.ndarray (N0,)
+        xyz_1   : np.ndarray (N1, 3)
+        radii_1 : np.ndarray (N1,)
+        """
+        rn0, an0, xyz_0, rn1, an1, xyz_1 = extract_atom_data_from_pose(pose, jump_id)
+
+        radii_0 = self.get_radii_from_names(rn0, an0)
+        radii_1 = self.get_radii_from_names(rn1, an1)
+
+        mask_0 = radii_0 > 0
+        mask_1 = radii_1 > 0
+
+        return xyz_0[mask_0], radii_0[mask_0], xyz_1[mask_1], radii_1[mask_1]
 
     def calc_contact_molecular_surface(self, dots0, dots1):
         """
@@ -2433,7 +2477,10 @@ if __name__ == '__main__':
     pose = pose_from_file(pdb)
 
     calc = MolecularSurfaceCalculator()
-    cms = calc.calc(pose)
+    xyz_0, radii_0, xyz_1, radii_1 = calc.partition_pose(pose)
+    calc.AddMolecule(0, xyz_0, radii_0)
+    calc.AddMolecule(1, xyz_1, radii_1)
+    cms = calc.CalcLoaded()
 
     print(cms)
 

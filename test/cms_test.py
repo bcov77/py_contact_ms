@@ -89,9 +89,6 @@ class TestCalculatorRun:
         self.atoms = [
             {
                 'natom':       int(a.natom[i]),
-                'nresidue':    int(a.nresidue[i]),
-                'atom':        a.atom_name[i],
-                'residue':     a.residue_name[i],
                 'molecule':    int(a.molecule[i]),
                 'radius':      float(a.radius[i]),
                 'density':     float(a.density[i]),
@@ -244,7 +241,7 @@ def compare_runs(current, golden, tol=TOLERANCE):
     # atoms
     _check_dict_list(
         'atoms', current.atoms, golden.atoms,
-        ['natom', 'nresidue', 'molecule', 'radius', 'density',
+        ['natom', 'molecule', 'radius', 'density',
          'atten', 'access', 'x', 'y', 'z', 'n_neighbors', 'n_buried'],
         tol, diffs,
     )
@@ -285,7 +282,10 @@ def run_test():
 
     # 2. Run calculator
     calc = MolecularSurfaceCalculator()
-    cms  = calc.calc(pose)
+    xyz_0, radii_0, xyz_1, radii_1 = calc.partition_pose(pose)
+    calc.AddMolecule(0, xyz_0, radii_0)
+    calc.AddMolecule(1, xyz_1, radii_1)
+    cms = calc.CalcLoaded()
     print(f"CMS value: {cms:.6f}")
 
     # 3. Snapshot run state
