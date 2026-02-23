@@ -10,11 +10,13 @@ API Notes:
 
 The only two functions you really need to call are get_radii_from_names() and calculate_contact_ms() 
 
+You may also want calculate_maximum_possible_contact_ms() if you are doing small molecule design
+
 '''
 
 
 
-def calculate_contact_ms(binder_xyz, binder_radii, target_xyz, target_radii, return_calc=False):
+def calculate_contact_ms(binder_xyz, binder_radii, target_xyz, target_radii):
     '''
     Main entrypoint into the code
 
@@ -43,10 +45,7 @@ def calculate_contact_ms(binder_xyz, binder_radii, target_xyz, target_radii, ret
     calc.add_binder_and_target(binder_xyz, binder_radii, target_xyz, target_radii)
     cms, per_atom_target_cms = calc.CalcLoaded()
 
-    if return_calc:
-        return cms, per_atom_target_cms, calc
-    else:
-        return cms, per_atom_target_cms
+    return cms, per_atom_target_cms, calc
 
 
 def get_radii_from_names(res_names, atom_names):
@@ -75,6 +74,34 @@ def get_radii_from_names(res_names, atom_names):
             radii[i] = radius_obj.radius
             break
     return radii
+
+
+def calculate_maximum_possible_contact_ms(xyz, radii):
+    '''
+    Main entrypoint into the code
+
+    Calculate maximum possible contact molecular surface of a molecule. This is basically just the surface area
+
+    Do not provide your own radii, you need to use the very specific radii raturned from get_radii_from_names()
+
+    Parameters
+    -------
+    xyz   : np.ndarray (N0, 3)
+    radii : np.ndarray (N0,)
+
+
+    Returns
+    -------
+    cms                 : float -- The maximum possible CMS
+    per_atom_target_cms : np.ndarray shape (N1,) — The per-atom contact_ms of your target molecule
+    '''
+
+    calc = MolecularSurfaceCalculator()
+    calc.AddMolecule(0, xyz, radii)
+    cms, per_atom_target_cms = calc.CalcLoadedMaxPossibleCMS()
+
+    return cms, per_atom_target_cms, calc
+
 
 
 def partition_pose(pose, jump_id=1):
@@ -726,9 +753,26 @@ class MolecularSurfaceCalculator:
         # Trim dot / probe arrays after surface generation
         self.run.dots[0].finalize()
         self.run.dots[1].finalize()
-        self.run.probes.finalize()
 
         cms_return = self.calc_contact_molecular_surface(target_side=True)
+
+        return cms_return
+
+    def CalcLoadedMaxPossibleCMS(self):
+        self.run.results.valid = 0
+        assert len(self.run.atoms) > 0
+
+        # Trim atom arrays to true size before vectorised attention assignment
+        self.run.atoms.finalize()
+
+        self.assign_attention_numbers(self.run.atoms, all_atoms=True)
+
+        self.generate_molecular_surfaces()
+
+        # Trim dot / probe arrays after surface generation
+        self.run.dots[0].finalize()
+
+        cms_return = self.calc_max_possible_contact_molecular_surface(target_side=True)
 
         return cms_return
 
@@ -824,6 +868,36 @@ class MolecularSurfaceCalculator:
 
         total_cms = float(per_atom_cms.sum())
         return total_cms, per_atom_cms
+
+
+    def calc_max_possible_contact_molecular_surface(self, target_side=True):
+        """
+        Compute the maximum possible contact molecular surface.
+
+        Returns the total surface area of molecule 0 and per-atom contributions,
+        with no distance weighting.  Only molecule 0 needs to be loaded.
+
+        Returns
+        -------
+        total_area    : float
+        per_atom_area : np.ndarray shape (n_mol0,)
+        """
+        n      = len(self.run.atoms)
+        mol    = self.run.atoms.molecule[:n]
+        n_mol0 = int((mol == 0).sum())
+
+        dots_0   = self.run.dots[0]
+        zero_ret = (0.0, np.zeros(n_mol0, dtype=np.float64))
+
+        if len(dots_0) == 0:
+            return zero_ret
+
+        per_atom_area = np.bincount(
+            dots_0.atom_idx, weights=dots_0.area, minlength=n_mol0
+        ).astype(np.float64)
+
+        total_area = float(per_atom_area.sum())
+        return total_area, per_atom_area
 
 
     def assign_attention_numbers(self, atoms, all_atoms=False):
@@ -2214,7 +2288,7 @@ if __name__ == '__main__':
     binder_xyz, binder_radii, target_xyz, target_radii= partition_pose(pose)
     cms, per_target_atom_cms, calc = calculate_contact_ms(binder_xyz, binder_radii, target_xyz, target_radii)
 
-    print(cms)
+    print('CMS: ', cms)
 
 
     d0    = calc.run.dots[0]
@@ -2222,5 +2296,8 @@ if __name__ == '__main__':
 
     d1    = calc.run.dots[1]
     dots1 = d1.coor_xyz
+
+    max_cms, max_cms_per_atom, calc2 = calculate_maximum_possible_contact_ms(target_xyz, target_radii)
+    print('Max CMS:', max_cms)
 
 
