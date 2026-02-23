@@ -1530,12 +1530,21 @@ class MolecularSurfaceCalculator:
         neigh_rad_flat = neigh_rad[atom_idx]
         neigh_natom_flat = neigh_natom[atom_idx]
 
-        d2 = np.sum((pij[:,None,:] - neigh_xyz_flat)**2, axis=-1)
+        # Exclude padding slots (natom < 0) and atom2 itself, then compute
+        # distances only on real neighbor entries — no NaN arithmetic.
+        exclude = (
+            (neigh_natom_flat < 0) |
+            (neigh_natom_flat == atom2.natom[atom_idx, None])
+        )
+        rows, cols    = np.where(~exclude)                               # (S,)
+        diff_active   = pij[rows] - neigh_xyz_flat[rows, cols]          # (S, 3)
+        d2_active     = np.einsum('ij,ij->i', diff_active, diff_active) # (S,) — single pass
+        within_active = d2_active < (neigh_rad_flat[rows, cols] + self.settings.rp) ** 2
 
-        mask = (neigh_natom_flat != atom2.natom[atom_idx,None])
-        too_close = (d2 < (neigh_rad_flat + self.settings.rp)**2) & mask
+        too_close_any = np.zeros(len(pij), dtype=bool)
+        too_close_any[rows[within_active]] = True
 
-        valid_point = ~np.any(too_close, axis=-1)
+        valid_point = ~too_close_any
 
         valid_point &= ~ ((atom1[atom_idx].atten == ATTEN_6)
                         & (atom2[atom_idx].atten == ATTEN_6)
@@ -2098,7 +2107,7 @@ class MolecularSurfaceCalculator:
 
         # Count valid points per element; ps = arc_length / count
         counts = np.sum(mask, axis=-1)
-        ps = np.where(counts > 0, rad * angle / counts, 0.0)
+        ps = np.where(counts > 0, rad * angle / np.clip(counts, 0.01, None), 0.0)
 
         return ps, points
 
