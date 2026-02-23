@@ -35,6 +35,10 @@ contact_ms, per_target_atom_cms, calc = calculate_contact_ms(binder_xyz, binder_
 
 # If you also want the binder-side, you can do this (avoids recomputing everything)
 binder_cms, per_binder_atom_cms = calc.calc_contact_molecular_surface(target_side=False)
+
+# If you are doing small-molecule design, you may also want to know the maximum CMS possible (basically the surface area)
+from py_contact_ms import calculate_maximum_possible_contact_ms
+max_target_cms, max_target_cms_per_atom = calculate_maximum_possible_contact_ms(target_xyz, target_radii)
 ```
 
 
