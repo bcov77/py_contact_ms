@@ -79,28 +79,6 @@ class Vec3:
     def to_numpy(self):
         return np.array([self.x_, self.y_, self.z_])
 
-class Atom(Vec3):
-
-    def __init__(self):
-        super().__init__(0.0, 0.0, 0.0)
-        self.natom = 0
-        self.nresidue = 0
-        self.atom = ""
-        self.residue = ""
-        self.molecule = 0
-        self.radius = 0.0
-        self.density = 0.0
-        self.atten = 0
-        self.access = 0
-        self.neighbors = []
-        self.buried = []
-
-    def __eq__(self, other):
-        return self is other
-
-    def __le__(self, other):
-        return self.natom <= other.natom
-
 
 class ResultsSurface:
     def __init__(self):
@@ -159,170 +137,15 @@ init('-mute all')
 #   • Vectorised callers (assign_attention_numbers, calc_contact_molecular_
 #     surface) operate directly on the numpy arrays for O(N²) → numpy speed.
 
-class AtomView:
-    """
-    Proxy to a single row in an AtomArray.
-
-    Scalar numeric fields (x_, y_, z_, radius, …) are backed by numpy arrays
-    inside the parent AtomArray.  Per-atom variable-length lists (neighbors,
-    buried) are stored as ordinary Python lists on the view object itself.
-    """
-
-    # These live on the view instance, not in the numpy arrays.
-    _LOCAL = frozenset({'_arr', '_idx', 'neighbors', 'buried'})
-
-    def __init__(self, arr, idx):
-        object.__setattr__(self, '_arr',      arr)
-        object.__setattr__(self, '_idx',      idx)
-        object.__setattr__(self, 'neighbors', [])
-        object.__setattr__(self, 'buried',    [])
-
-    # ── numpy-backed scalar properties ────────────────────────────────────
-
-    @property
-    def x_(self):            return float(self._arr.xyz[self._idx,0])
-    @x_.setter
-    def x_(self, v):         self._arr.xyz[self._idx,0] = v
-
-    @property
-    def y_(self):            return float(self._arr.xyz[self._idx, 1])
-    @y_.setter
-    def y_(self, v):         self._arr.xyz[self._idx, 1] = v
-
-    @property
-    def z_(self):            return float(self._arr.xyz[self._idx, 2])
-    @z_.setter
-    def z_(self, v):         self._arr.xyz[self._idx, 2] = v
-
-    @property
-    def natom(self):         return int(self._arr.natom[self._idx])
-    @natom.setter
-    def natom(self, v):      self._arr.natom[self._idx] = v
-
-    @property
-    def nresidue(self):      return int(self._arr.nresidue[self._idx])
-    @nresidue.setter
-    def nresidue(self, v):   self._arr.nresidue[self._idx] = v
-
-    @property
-    def molecule(self):      return int(self._arr.molecule[self._idx])
-    @molecule.setter
-    def molecule(self, v):   self._arr.molecule[self._idx] = v
-
-    @property
-    def radius(self):        return float(self._arr.radius[self._idx])
-    @radius.setter
-    def radius(self, v):     self._arr.radius[self._idx] = v
-
-    @property
-    def density(self):       return float(self._arr.density[self._idx])
-    @density.setter
-    def density(self, v):    self._arr.density[self._idx] = v
-
-    @property
-    def atten(self):         return int(self._arr.atten[self._idx])
-    @atten.setter
-    def atten(self, v):      self._arr.atten[self._idx] = v
-
-    @property
-    def access(self):        return int(self._arr.access[self._idx])
-    @access.setter
-    def access(self, v):     self._arr.access[self._idx] = v
-
-    # String fields stored in Python lists inside AtomArray
-    @property
-    def atom(self):          return self._arr.atom_name[self._idx]
-    @atom.setter
-    def atom(self, v):       self._arr.atom_name[self._idx] = v
-
-    @property
-    def residue(self):       return self._arr.residue_name[self._idx]
-    @residue.setter
-    def residue(self, v):    self._arr.residue_name[self._idx] = v
-
-    # ── Vec3-compatible interface ──────────────────────────────────────────
-
-    def x(self, value=None):
-        if value is None: return self.x_
-        self.x_ = float(value)
-
-    def y(self, value=None):
-        if value is None: return self.y_
-        self.y_ = float(value)
-
-    def z(self, value=None):
-        if value is None: return self.z_
-        self.z_ = float(value)
-
-    def to_numpy(self):
-        return np.array([self.x_, self.y_, self.z_])
-
-    def __add__(self, other):
-        return Vec3(self.x_ + other.x_, self.y_ + other.y_, self.z_ + other.z_)
-
-    def __sub__(self, other):
-        return Vec3(self.x_ - other.x_, self.y_ - other.y_, self.z_ - other.z_)
-
-    def __mul__(self, scalar):
-        return Vec3(self.x_ * scalar, self.y_ * scalar, self.z_ * scalar)
-
-    def __truediv__(self, scalar):
-        return Vec3(self.x_ / scalar, self.y_ / scalar, self.z_ / scalar)
-
-    def __neg__(self):
-        return Vec3(-self.x_, -self.y_, -self.z_)
-
-    def dot(self, other):
-        return self.x_*other.x_ + self.y_*other.y_ + self.z_*other.z_
-
-    def cross(self, other):
-        return Vec3(
-            self.y_*other.z_ - self.z_*other.y_,
-            self.z_*other.x_ - self.x_*other.z_,
-            self.x_*other.y_ - self.y_*other.x_,
-        )
-
-    def magnitude_squared(self):
-        return self.x_*self.x_ + self.y_*self.y_ + self.z_*self.z_
-
-    def magnitude(self):
-        return math.sqrt(self.magnitude_squared())
-
-    def normalize(self):
-        mag = self.magnitude()
-        if mag > 0:
-            self.x_ /= mag
-            self.y_ /= mag
-            self.z_ /= mag
-
-    def distance(self, other):
-        dx = self.x_ - other.x_; dy = self.y_ - other.y_; dz = self.z_ - other.z_
-        return math.sqrt(dx*dx + dy*dy + dz*dz)
-
-    def distance_squared(self, other):
-        dx = self.x_ - other.x_; dy = self.y_ - other.y_; dz = self.z_ - other.z_
-        return dx*dx + dy*dy + dz*dz
-
-    # ── identity / ordering (matching Atom semantics) ─────────────────────
-
-    def __eq__(self, other):  return self.natom == other.natom
-    def __le__(self, other):  return self.natom <= other.natom
-    def __hash__(self):       return id(self)
-
-    def __repr__(self):
-        return f"AtomView({self._idx}: {self.residue}:{self.atom} mol={self.molecule})"
-
-
 class AtomArray:
     """
     Struct-of-arrays container for Atom data.
 
-    Grows dynamically via append(); call finalize() to trim arrays to their
-    true size before running vectorised operations.
+    Grows dynamically via append() or extend_from_arrays(); call finalize() to
+    trim arrays to their true size before running vectorised operations.
 
-    Iterating or indexing always returns the *same cached AtomView* object for
-    a given index, preserving Python identity so that "atom1 is atom2" checks
-    inside the surface-generation algorithm remain correct.
+    Indexing with a slice, boolean mask, or integer array returns a new
+    AtomArray containing the selected rows.
     """
 
     _INITIAL_CAP = 256
@@ -346,8 +169,6 @@ class AtomArray:
         self.residue_name = [''] * cap
         self.xyz = np.zeros((cap, 3), dtype=np.float64)
 
-        self._views: dict = {}   # index → AtomView cache
-
     def _grow(self):
         new_cap = self._cap * 2
         for f in self._FLOAT_FIELDS + self._INT8_FIELDS + self._INT32_FIELDS:
@@ -363,58 +184,63 @@ class AtomArray:
         self._cap = new_cap
 
     def append(self, atom):
-        """Copy data from an Atom (or AtomView) into the array; return a cached AtomView."""
+        """Copy data from an Atom into the array."""
         if self._n >= self._cap:
             self._grow()
         i = self._n
-        self.xyz[i,0]           = atom.x_
-        self.xyz[i,1]           = atom.y_
-        self.xyz[i,2]           = atom.z_
-        self.radius[i]      = atom.radius
-        self.density[i]     = atom.density
-        self.natom[i]       = atom.natom
-        self.nresidue[i]    = atom.nresidue
-        self.molecule[i]    = atom.molecule
-        self.atten[i]       = atom.atten
-        self.access[i]      = atom.access
-        self.atom_name[i]   = atom.atom
-        self.residue_name[i]= atom.residue
+        self.xyz[i,0]            = atom.x_
+        self.xyz[i,1]            = atom.y_
+        self.xyz[i,2]            = atom.z_
+        self.radius[i]           = atom.radius
+        self.density[i]          = atom.density
+        self.natom[i]            = atom.natom
+        self.nresidue[i]         = atom.nresidue
+        self.molecule[i]         = atom.molecule
+        self.atten[i]            = atom.atten
+        self.access[i]           = atom.access
+        self.atom_name[i]        = atom.atom
+        self.residue_name[i]     = atom.residue
         self._n += 1
-        view = AtomView(self, i)
-        assert view._idx == view.natom
-        self._views[i] = view
-        return view
+
+    def extend_from_arrays(self, xyz, radii, density, molecule):
+        """
+        Bulk-append N atoms from pre-computed numpy arrays.
+
+        natom values are assigned as sequential indices starting from the
+        current length.  nresidue, atom_name, and residue_name are left at
+        their zero/empty defaults.
+
+        Parameters
+        ----------
+        xyz      : np.ndarray (N, 3)
+        radii    : np.ndarray (N,)
+        density  : float or np.ndarray broadcastable to (N,)
+        molecule : int  0 or 1
+        """
+        n = len(radii)
+        if n == 0:
+            return
+        while self._n + n > self._cap:
+            self._grow()
+        i = self._n
+        self.xyz[i:i+n]      = xyz
+        self.radius[i:i+n]   = radii
+        self.density[i:i+n]  = density
+        self.molecule[i:i+n] = molecule
+        self.natom[i:i+n]    = np.arange(i, i + n, dtype=np.int32)
+        self.access[i:i+n]   = 0
+        self._n += n
 
     def __len__(self):   return self._n
     def __bool__(self):  return self._n > 0
 
     def __getitem__(self, idx):
-
-        # ---------------------------------------------------------
-        # Single integer index → return AtomView (existing behavior)
-        # ---------------------------------------------------------
-        if isinstance(idx, (int, np.integer)):
-
-            if idx < 0:
-                idx = self._n + idx
-
-            if idx < 0 or idx >= self._n:
-                raise IndexError("AtomArray index out of range")
-
-            if idx not in self._views:
-                self._views[idx] = AtomView(self, idx)
-
-            return self._views[idx]
-
-        # ---------------------------------------------------------
-        # Slice or fancy indexing → return new AtomArray
-        # ---------------------------------------------------------
+        """Slice, boolean mask, or integer array → new AtomArray."""
 
         # Convert slice to explicit indices
         if isinstance(idx, slice):
             indices = np.arange(self._n)[idx]
         else:
-            # boolean mask or fancy index
             indices = np.asarray(idx)
 
             if indices.dtype == bool:
@@ -428,44 +254,28 @@ class AtomArray:
         if np.any((indices < 0) | (indices >= self._n)):
             raise IndexError("AtomArray index out of range")
 
-        # ---------------------------------------------------------
         # Build new AtomArray
-        # ---------------------------------------------------------
         new = AtomArray()
 
         new._n = len(indices)
         new._cap = new._n
 
-        # Copy numeric fields
         for f in self._FLOAT_FIELDS + self._INT8_FIELDS + self._INT32_FIELDS:
             arr = getattr(self, f)
             setattr(new, f, arr[indices].copy())
 
-        # Copy xyz
-        new.xyz = self.xyz[indices].copy()
-
-        # Copy string fields
+        new.xyz          = self.xyz[indices].copy()
         new.atom_name    = [self.atom_name[i]    for i in indices]
         new.residue_name = [self.residue_name[i] for i in indices]
 
-        # Fresh view cache
-        new._views = {}
-        for iidx, idx in enumerate(indices):
-            if idx in self._views:
-                new._views[iidx] = self._views[idx]
-
         new.finalize()
         return new
-
-    def __iter__(self):
-        for i in range(self._n):
-            yield self[i]
 
     def finalize(self):
         """Trim all arrays to [0:n].  Call once after all appends are done."""
         for f in self._FLOAT_FIELDS + self._INT8_FIELDS + self._INT32_FIELDS:
             setattr(self, f, getattr(self, f)[:self._n].copy())
-        self.xyz    = self.xyz[:self._n]
+        self.xyz          = self.xyz[:self._n]
         self.atom_name    = self.atom_name[:self._n]
         self.residue_name = self.residue_name[:self._n]
 
@@ -876,22 +686,13 @@ class MolecularSurfaceCalculator:
                                                <= 0 are skipped
         """
         mol_val = 1 if molecule == 1 else 0
-        for i in range(len(radii)):
-            r = float(radii[i])
-            if r <= 0:
-                continue
-            atom = Atom()
-            atom.x_      = float(xyz[i, 0])
-            atom.y_      = float(xyz[i, 1])
-            atom.z_      = float(xyz[i, 2])
-            atom.radius  = r
-            atom.density = self.settings.density
-            atom.molecule = mol_val
-            atom.natom   = len(self.run.atoms)
-            atom.access  = 0
-            self.run.atoms.append(atom)
-            self.run.results.surface[mol_val].nAtoms += 1
-            self.run.results.nAtoms += 1
+        mask = np.asarray(radii) > 0
+        xyz_f   = np.asarray(xyz)[mask]
+        radii_f = np.asarray(radii)[mask]
+        n = len(radii_f)
+        self.run.atoms.extend_from_arrays(xyz_f, radii_f, self.settings.density, mol_val)
+        self.run.results.surface[mol_val].nAtoms += n
+        self.run.results.nAtoms += n
 
     def assign_atom_radius(self, atom):
         """
@@ -1110,10 +911,7 @@ class MolecularSurfaceCalculator:
         """
 
         # Compute maximum atom radius
-        self.run.radmax = 0.0
-        for atom in self.run.atoms:
-            if atom.radius > self.run.radmax:
-                self.run.radmax = atom.radius
+        self.run.radmax = self.run.atoms.radius.max()
 
 
         good_atom = self.build_neighbor_arrays()
