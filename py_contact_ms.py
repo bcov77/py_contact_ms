@@ -763,27 +763,49 @@ class MolecularSurfaceCalculator:
         Compute the contact molecular surface (vectorised).
 
         Replaces the O(K²) Python nested loop with a single cdist call.
-        For each buried dot in molecule 0 the nearest buried dot in molecule 1
+        For each buried dot in molecule 1 the nearest buried dot in molecule 0
         is found in one shot; the weighted area sum is then a numpy reduction.
+
+        Returns
+        -------
+        total_cms           : float
+        per_atom_target_cms : np.ndarray shape (n_mol1_atoms,)
         """
+        n        = len(self.run.atoms)
+        n_mol1   = int((self.run.atoms.molecule[:n] == 1).sum())
+        zero_ret = (0.0, np.zeros(n_mol1, dtype=np.float64))
+
         if len(dots0) == 0:
-            return 0.0
+            return zero_ret
 
         buried0 = dots0.buried.astype(bool)
         buried1 = dots1.buried.astype(bool)
 
         if not buried0.any() or not buried1.any():
-            return 0.0
+            return zero_ret
 
-        xyz0_b  = dots0.coor_xyz[buried0]   # (K0, 3)
-        xyz1_b  = dots1.coor_xyz[buried1]   # (K1, 3)
-        area0_b = dots0.area[buried0]                        # (K0,)
+        xyz0_b   = dots0.coor_xyz[buried0]                            # (K0, 3)
+        xyz1_b   = dots1.coor_xyz[buried1]                            # (K1, 3)
+        area1_b  = dots1.area[buried1]                                # (K1,)
 
-        dist_sq      = cdist(xyz0_b, xyz1_b, metric='sqeuclidean')  # (K0, K1)
-        min_dist_sq  = dist_sq.min(axis=1)                           # (K0,)
+        dist_sq     = cdist(xyz0_b, xyz1_b, metric='sqeuclidean')     # (K0, K1)
+        min_dist_sq = dist_sq.min(axis=0)                             # (K1,)
 
-        per_atom_target_cms = area0_b * np.exp(-min_dist_sq * self.settings.weight)
-        total_cms = float((per_atom_target_cms.sum()).sum())
+        per_dot_cms = area1_b * np.exp(-min_dist_sq * self.settings.weight)  # (K1,)
+
+        # Sum per-dot contributions into per-atom bins.
+        # dots1.atom_idx holds global atom indices; mol1 atoms occupy the last
+        # n_mol1 slots of self.run.atoms, so subtract the offset to get a
+        # 0-based local index within the mol1 atom array.
+        mol1_start  = n - n_mol1
+        local_idx   = dots1.atom_idx[buried1] - mol1_start            # (K1,)
+        per_atom_target_cms = np.bincount(
+            local_idx, weights=per_dot_cms, minlength=n_mol1
+        ).astype(np.float64)
+
+
+        total_cms = float(per_atom_target_cms.sum())
+        assert np.isclose(per_dot_cms.sum(), total_cms)
         return total_cms, per_atom_target_cms
 
 
@@ -2165,9 +2187,7 @@ class MolecularSurfaceCalculator:
 if __name__ == '__main__':
 
     import sys
-    from pyrosetta import rosetta
-    from pyrosetta import *
-    from pyrosetta.rosetta import *
+    from pyrosetta import init, pose_from_file
     init('-mute all')
 
     pdb = sys.argv[1]
@@ -2175,7 +2195,7 @@ if __name__ == '__main__':
     pose = pose_from_file(pdb)
 
     binder_xyz, binder_radii, target_xyz, target_radii= partition_pose(pose)
-    cms, per_atom_cms, calc = calculate_contact_ms(binder_xyz, binder_radii, target_xyz, target_radii, return_calc=True)
+    cms, per_target_atom_cms, calc = calculate_contact_ms(binder_xyz, binder_radii, target_xyz, target_radii, return_calc=True)
 
     print(cms)
 

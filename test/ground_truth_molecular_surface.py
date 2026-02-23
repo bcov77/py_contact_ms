@@ -14,6 +14,9 @@ import npose_util as nu
 
 
 pose = pose_from_file(sys.argv[1])
+binder, target = pose.split_by_chain()
+pose = target
+target.append_pose_by_jump(binder, 1)
 
 
 # calc = core.scoring.sc.MolecularSurfaceCalculator()
