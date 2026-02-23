@@ -728,7 +728,7 @@ class MolecularSurfaceCalculator:
         self.run.dots[1].finalize()
         self.run.probes.finalize()
 
-        cms_return = self.calc_contact_molecular_surface(self.run.dots[0], self.run.dots[1])
+        cms_return = self.calc_contact_molecular_surface(target_side=True)
 
         return cms_return
 
@@ -765,56 +765,65 @@ class MolecularSurfaceCalculator:
         self.run.results.nAtoms += n
 
 
-
-    def calc_contact_molecular_surface(self, dots0, dots1):
+    def calc_contact_molecular_surface(self, target_side=True):
         """
         Compute the contact molecular surface (vectorised).
 
-        Replaces the O(K²) Python nested loop with a single cdist call.
-        For each buried dot in molecule 1 the nearest buried dot in molecule 0
-        is found in one shot; the weighted area sum is then a numpy reduction.
+        For each buried dot on the *query* molecule the nearest buried dot on
+        the *reference* molecule is found; the weighted area sum gives the CMS.
+
+        target_side=True  (default): query=mol1, reference=mol0.
+            Returns per-atom values sized (n_mol1,).
+        target_side=False           : query=mol0, reference=mol1.
+            Returns per-atom values sized (n_mol0,).
 
         Returns
         -------
-        total_cms           : float
-        per_atom_target_cms : np.ndarray shape (n_mol1_atoms,)
+        total_cms    : float
+        per_atom_cms : np.ndarray shape (n_query_atoms,)
         """
-        n        = len(self.run.atoms)
-        n_mol1   = int((self.run.atoms.molecule[:n] == 1).sum())
-        zero_ret = (0.0, np.zeros(n_mol1, dtype=np.float64))
+        n      = len(self.run.atoms)
+        mol    = self.run.atoms.molecule[:n]
+        n_mol1 = int((mol == 1).sum())
+        n_mol0 = n - n_mol1
 
-        if len(dots0) == 0:
+        if target_side:
+            dots_q, dots_r = self.run.dots[1], self.run.dots[0]
+            n_q            = n_mol1
+            atom_offset    = n_mol0      # mol1 atoms start here in the global array
+        else:
+            dots_q, dots_r = self.run.dots[0], self.run.dots[1]
+            n_q            = n_mol0
+            atom_offset    = 0           # mol0 atoms start at index 0
+
+        zero_ret = (0.0, np.zeros(n_q, dtype=np.float64))
+
+        if len(dots_r) == 0:
             return zero_ret
 
-        buried0 = dots0.buried.astype(bool)
-        buried1 = dots1.buried.astype(bool)
+        buried_q = dots_q.buried.astype(bool)
+        buried_r = dots_r.buried.astype(bool)
 
-        if not buried0.any() or not buried1.any():
+        if not buried_q.any() or not buried_r.any():
             return zero_ret
 
-        xyz0_b   = dots0.coor_xyz[buried0]                            # (K0, 3)
-        xyz1_b   = dots1.coor_xyz[buried1]                            # (K1, 3)
-        area1_b  = dots1.area[buried1]                                # (K1,)
+        xyz_q  = dots_q.coor_xyz[buried_q]                            # (Kq, 3)
+        xyz_r  = dots_r.coor_xyz[buried_r]                            # (Kr, 3)
+        area_q = dots_q.area[buried_q]                                # (Kq,)
 
-        dist_sq     = cdist(xyz0_b, xyz1_b, metric='sqeuclidean')     # (K0, K1)
-        min_dist_sq = dist_sq.min(axis=0)                             # (K1,)
+        dist_sq     = cdist(xyz_r, xyz_q, metric='sqeuclidean')       # (Kr, Kq)
+        min_dist_sq = dist_sq.min(axis=0)                             # (Kq,)
 
-        per_dot_cms = area1_b * np.exp(-min_dist_sq * self.settings.weight)  # (K1,)
+        per_dot_cms = area_q * np.exp(-min_dist_sq * self.settings.weight)  # (Kq,)
 
-        # Sum per-dot contributions into per-atom bins.
-        # dots1.atom_idx holds global atom indices; mol1 atoms occupy the last
-        # n_mol1 slots of self.run.atoms, so subtract the offset to get a
-        # 0-based local index within the mol1 atom array.
-        mol1_start  = n - n_mol1
-        local_idx   = dots1.atom_idx[buried1] - mol1_start            # (K1,)
-        per_atom_target_cms = np.bincount(
-            local_idx, weights=per_dot_cms, minlength=n_mol1
+        # Sum per-dot contributions into per-atom bins using a 0-based local index.
+        local_idx    = dots_q.atom_idx[buried_q] - atom_offset        # (Kq,)
+        per_atom_cms = np.bincount(
+            local_idx, weights=per_dot_cms, minlength=n_q
         ).astype(np.float64)
 
-
-        total_cms = float(per_atom_target_cms.sum())
-        assert np.isclose(per_dot_cms.sum(), total_cms)
-        return total_cms, per_atom_target_cms
+        total_cms = float(per_atom_cms.sum())
+        return total_cms, per_atom_cms
 
 
     def assign_attention_numbers(self, atoms, all_atoms=False):
@@ -2203,7 +2212,7 @@ if __name__ == '__main__':
     pose = pose_from_file(pdb)
 
     binder_xyz, binder_radii, target_xyz, target_radii= partition_pose(pose)
-    cms, per_target_atom_cms, calc = calculate_contact_ms(binder_xyz, binder_radii, target_xyz, target_radii, return_calc=True)
+    cms, per_target_atom_cms, calc = calculate_contact_ms(binder_xyz, binder_radii, target_xyz, target_radii)
 
     print(cms)
 
