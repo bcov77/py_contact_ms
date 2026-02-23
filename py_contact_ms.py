@@ -305,63 +305,55 @@ class DotArray:
         self._n   = 0
         self._cap = cap
 
-        for f in ('coor_x', 'coor_y', 'coor_z',
-                  'outnml_x', 'outnml_y', 'outnml_z', 'area'):
-            setattr(self, f, np.zeros(cap, dtype=np.float64))
+        self.coor_xyz   = np.zeros((cap, 3), dtype=np.float64)
+        self.outnml_xyz = np.zeros((cap, 3), dtype=np.float64)
+        self.area       = np.zeros(cap, dtype=np.float64)
         for f in ('buried', 'type_'):
             setattr(self, f, np.zeros(cap, dtype=np.int8))
         self.atom_idx = np.zeros(cap, dtype=np.int32)
 
     def _grow(self):
         new_cap = self._cap * 2
-        for f in ('coor_x', 'coor_y', 'coor_z',
-                  'outnml_x', 'outnml_y', 'outnml_z', 'area',
-                  'buried', 'type_', 'atom_idx'):
+        for f in ('coor_xyz', 'outnml_xyz', 'area', 'buried', 'type_', 'atom_idx'):
             old = getattr(self, f)
-            new = np.zeros(new_cap, dtype=old.dtype)
+            new = np.zeros((new_cap,) + old.shape[1:], dtype=old.dtype)
             new[:self._n] = old[:self._n]
             setattr(self, f, new)
         self._cap = new_cap
 
-    def append(self, coor_x, coor_y, coor_z,
-               outnml_x, outnml_y, outnml_z,
-               area, buried, type_, atom_idx):
+    def append(self, coor_xyz, outnml_xyz, area, buried, type_, atom_idx):
         if self._n >= self._cap:
             self._grow()
         i = self._n
-        self.coor_x[i]   = coor_x;  self.coor_y[i]   = coor_y;  self.coor_z[i]   = coor_z
-        self.outnml_x[i] = outnml_x; self.outnml_y[i] = outnml_y; self.outnml_z[i] = outnml_z
-        self.area[i]     = area
-        self.buried[i]   = buried
-        self.type_[i]    = type_
-        self.atom_idx[i] = atom_idx
+        self.coor_xyz[i]   = coor_xyz
+        self.outnml_xyz[i] = outnml_xyz
+        self.area[i]       = area
+        self.buried[i]     = buried
+        self.type_[i]      = type_
+        self.atom_idx[i]   = atom_idx
         self._n += 1
 
-    def extend(self, coor_x, coor_y, coor_z,
-               outnml_x, outnml_y, outnml_z,
-               area, buried, type_, atom_idx):
+    def extend(self, coor_xyz, outnml_xyz, area, buried, type_, atom_idx):
         """Batch-append n dots in a single slice assignment."""
-        n = len(coor_x)
+        n = len(coor_xyz)
         if n == 0:
             return
         while self._n + n > self._cap:
             self._grow()
         i = self._n
-        self.coor_x[i:i+n]   = coor_x;   self.coor_y[i:i+n]   = coor_y;   self.coor_z[i:i+n]   = coor_z
-        self.outnml_x[i:i+n] = outnml_x; self.outnml_y[i:i+n] = outnml_y; self.outnml_z[i:i+n] = outnml_z
-        self.area[i:i+n]     = area
-        self.buried[i:i+n]   = buried
-        self.type_[i:i+n]    = type_
-        self.atom_idx[i:i+n] = atom_idx
+        self.coor_xyz[i:i+n]   = coor_xyz
+        self.outnml_xyz[i:i+n] = outnml_xyz
+        self.area[i:i+n]       = area
+        self.buried[i:i+n]     = buried
+        self.type_[i:i+n]      = type_
+        self.atom_idx[i:i+n]   = atom_idx
         self._n += n
 
     def __len__(self):   return self._n
     def __bool__(self):  return self._n > 0
 
     def finalize(self):
-        for f in ('coor_x', 'coor_y', 'coor_z',
-                  'outnml_x', 'outnml_y', 'outnml_z', 'area',
-                  'buried', 'type_', 'atom_idx'):
+        for f in ('coor_xyz', 'outnml_xyz', 'area', 'buried', 'type_', 'atom_idx'):
             setattr(self, f, getattr(self, f)[:self._n].copy())
 
 
@@ -762,12 +754,8 @@ class MolecularSurfaceCalculator:
         if not buried0.any() or not buried1.any():
             return 0.0
 
-        xyz0_b  = np.column_stack([dots0.coor_x[buried0],
-                                   dots0.coor_y[buried0],
-                                   dots0.coor_z[buried0]])   # (K0, 3)
-        xyz1_b  = np.column_stack([dots1.coor_x[buried1],
-                                   dots1.coor_y[buried1],
-                                   dots1.coor_z[buried1]])   # (K1, 3)
+        xyz0_b  = dots0.coor_xyz[buried0]   # (K0, 3)
+        xyz1_b  = dots1.coor_xyz[buried1]   # (K1, 3)
         area0_b = dots0.area[buried0]                        # (K0,)
 
         dist_sq      = cdist(xyz0_b, xyz1_b, metric='sqeuclidean')  # (K0, K1)
@@ -1997,8 +1985,7 @@ class MolecularSurfaceCalculator:
             if not mask.any():
                 continue
             self.run.dots[mol].extend(
-                coor[mask, 0], coor[mask, 1], coor[mask, 2],
-                outnml[mask, 0], outnml[mask, 1], outnml[mask, 2],
+                coor[mask], outnml[mask],
                 area[mask], buried[mask], type_arr[mask], atom_indices[mask],
             )
 
@@ -2171,10 +2158,10 @@ if __name__ == '__main__':
 
 
     d0    = calc.run.dots[0]
-    dots0 = np.column_stack([d0.coor_x, d0.coor_y, d0.coor_z])
+    dots0 = d0.coor_xyz
 
     d1    = calc.run.dots[1]
-    dots1 = np.column_stack([d1.coor_x, d1.coor_y, d1.coor_z])
+    dots1 = d1.coor_xyz
 
     # pr    = calc.run.probes
     # probes = np.column_stack([pr.point_x, pr.point_y, pr.point_z]) if len(pr) else np.empty((0, 3))

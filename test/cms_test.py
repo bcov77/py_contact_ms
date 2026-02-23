@@ -111,9 +111,9 @@ class TestCalculatorRun:
             nd = len(d)
             self.dots[mol] = [
                 {
-                    'coor_x':   float(d.coor_x[i]),
-                    'coor_y':   float(d.coor_y[i]),
-                    'coor_z':   float(d.coor_z[i]),
+                    'coor_x':   float(d.coor_xyz[i, 0]),
+                    'coor_y':   float(d.coor_xyz[i, 1]),
+                    'coor_z':   float(d.coor_xyz[i, 2]),
                     'area':     float(d.area[i]),
                     'buried':   int(d.buried[i]),
                     'type':     int(d.type_[i]),
@@ -129,9 +129,9 @@ class TestCalculatorRun:
             nd = len(d)
             self.trimmed_dots[mol] = [
                 {
-                    'coor_x':   float(d.coor_x[i]),
-                    'coor_y':   float(d.coor_y[i]),
-                    'coor_z':   float(d.coor_z[i]),
+                    'coor_x':   float(d.coor_xyz[i, 0]),
+                    'coor_y':   float(d.coor_xyz[i, 1]),
+                    'coor_z':   float(d.coor_xyz[i, 2]),
                     'area':     float(d.area[i]),
                     'buried':   int(d.buried[i]),
                     'type':     int(d.type_[i]),
