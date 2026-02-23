@@ -355,74 +355,26 @@ class DotArray:
             setattr(self, f, getattr(self, f)[:self._n].copy())
 
 
-class ProbeView:
-    """Proxy to a single row in a ProbeArray."""
-
-    def __init__(self, arr, atom_arr, idx):
-        object.__setattr__(self, '_arr',      arr)
-        object.__setattr__(self, '_atom_arr', atom_arr)
-        object.__setattr__(self, '_idx',      idx)
-
-    @property
-    def height(self):
-        return float(self._arr.height[self._idx])
-
-    @property
-    def point(self):
-        i = self._idx
-        return Vec3.from_xyz(self._arr.point_xyz[i])
-
-    @property
-    def alt(self):
-        i = self._idx
-        return Vec3.from_xyz(self._arr.alt_xyz[i])
-
-    @property
-    def pAtoms(self):
-        i = self._idx
-        return [self._atom_arr[int(self._arr.atom_idx_0[i])],
-                self._atom_arr[int(self._arr.atom_idx_1[i])],
-                self._atom_arr[int(self._arr.atom_idx_2[i])]]
-
-    def __eq__(self, other): return self is other
-    def __hash__(self):      return id(self)
-
-
 class ProbeArray:
-    """
-    Struct-of-arrays container for PROBE data.
-
-    Like AtomArray, indexing returns cached ProbeView objects so that
-    "probe is lprobe" identity comparisons in generate_concave_surface work.
-    """
+    """Struct-of-arrays container for PROBE data."""
 
     _INITIAL_CAP = 1024
 
-    def __init__(self, atom_arr):
+    def __init__(self):
         cap = self._INITIAL_CAP
-        self._n        = 0
-        self._cap      = cap
-        self._atom_arr = atom_arr
+        self._n   = 0
+        self._cap = cap
 
-        for f in ('height',
-                  # 'point_x', 'point_y', 'point_z',
-                  # 'alt_x',   'alt_y',   'alt_z'
-                  ):
-            setattr(self, f, np.zeros(cap, dtype=np.float64))
-        for f in ('atom_idx_0', 'atom_idx_1', 'atom_idx_2'):
-            setattr(self, f, np.zeros(cap, dtype=np.int32))
-
-        self.point_xyz = np.zeros((cap, 3), dtype=np.float64)
-        self.alt_xyz = np.zeros((cap, 3), dtype=np.float64)
-
-        self._views: dict = {}
+        self.height    = np.zeros(cap, dtype=np.float64)
+        self.atom_idx_0 = np.zeros(cap, dtype=np.int32)
+        self.atom_idx_1 = np.zeros(cap, dtype=np.int32)
+        self.atom_idx_2 = np.zeros(cap, dtype=np.int32)
+        self.point_xyz  = np.zeros((cap, 3), dtype=np.float64)
+        self.alt_xyz    = np.zeros((cap, 3), dtype=np.float64)
 
     def _grow(self):
         new_cap = self._cap * 2
-        for f in ('height',
-                  # 'point_x', 'point_y', 'point_z',
-                  # 'alt_x',   'alt_y',   'alt_z',
-                  'atom_idx_0', 'atom_idx_1', 'atom_idx_2'):
+        for f in ('height', 'atom_idx_0', 'atom_idx_1', 'atom_idx_2'):
             old = getattr(self, f)
             new = np.zeros(new_cap, dtype=old.dtype)
             new[:self._n] = old[:self._n]
@@ -432,44 +384,43 @@ class ProbeArray:
         self.point_xyz = np.zeros((new_cap, 3), dtype=np.float64)
         self.point_xyz[:self._n] = point_xyz_old[:self._n]
 
-        alt_xyz_old = self.xyz
+        alt_xyz_old = self.alt_xyz
         self.alt_xyz = np.zeros((new_cap, 3), dtype=np.float64)
         self.alt_xyz[:self._n] = alt_xyz_old[:self._n]
 
         self._cap = new_cap
 
-    def append(self, atom_idx_0, atom_idx_1, atom_idx_2, height, point_xyz, alt_xyz):
-        """point and alt are Vec3 (or anything with .x_, .y_, .z_)."""
-        if self._n >= self._cap:
+    def extend_from_arrays(self, atom_idx_0, atom_idx_1, atom_idx_2,
+                           height, point_xyz, alt_xyz):
+        """
+        Bulk-append N probes from pre-computed numpy arrays.
+
+        Parameters
+        ----------
+        atom_idx_0, atom_idx_1, atom_idx_2 : array-like (N,)   int32
+        height    : array-like (N,)    float64
+        point_xyz : array-like (N, 3)  float64  probe centre coordinates
+        alt_xyz   : array-like (N, 3)  float64  alternate axis coordinates
+        """
+        n = len(height)
+        if n == 0:
+            return
+        while self._n + n > self._cap:
             self._grow()
         i = self._n
-        self.atom_idx_0[i] = atom_idx_0
-        self.atom_idx_1[i] = atom_idx_1
-        self.atom_idx_2[i] = atom_idx_2
-        self.height[i]     = height
-        self.point_xyz[i] = point_xyz
-        self.alt_xyz[i]   = alt_xyz
-        self._n += 1
-        view = ProbeView(self, self._atom_arr, i)
-        self._views[i] = view
-        return view
+        self.atom_idx_0[i:i+n] = atom_idx_0
+        self.atom_idx_1[i:i+n] = atom_idx_1
+        self.atom_idx_2[i:i+n] = atom_idx_2
+        self.height[i:i+n]     = height
+        self.point_xyz[i:i+n]  = point_xyz
+        self.alt_xyz[i:i+n]    = alt_xyz
+        self._n += n
 
     def __len__(self):   return self._n
     def __bool__(self):  return self._n > 0
 
-    def __getitem__(self, idx):
-        if idx not in self._views:
-            self._views[idx] = ProbeView(self, self._atom_arr, idx)
-        return self._views[idx]
-
-    def __iter__(self):
-        for i in range(self._n):
-            yield self[i]
-
     def finalize(self):
-        for f in ('height',
-                  'point_xyz',
-                  'alt_xyz', 
+        for f in ('height', 'point_xyz', 'alt_xyz',
                   'atom_idx_0', 'atom_idx_1', 'atom_idx_2'):
             setattr(self, f, getattr(self, f)[:self._n].copy())
 
@@ -585,7 +536,7 @@ class MolecularSurfaceCalculator:
         self.run.atoms      = AtomArray()
         self.run.dots       = [DotArray(), DotArray()]
         self.run.trimmed_dots = [DotArray(), DotArray()]
-        self.run.probes     = ProbeArray(self.run.atoms)
+        self.run.probes     = ProbeArray()
         self.run.neighbor_array = None
         self.run.buried_array = None
         self.run.toroid_queue = []
@@ -1338,15 +1289,10 @@ class MolecularSurfaceCalculator:
         probe_a1_f = probe_a1[valid_probe].astype(np.int32)
         probe_a2_f = probe_a2[valid_probe].astype(np.int32)
 
-        for i in range(len(pijk_f)):
-            self.run.probes.append(
-                int(probe_a0_f[i]),
-                int(probe_a1_f[i]),
-                int(probe_a2_f[i]),
-                float(hijk_f[i]),
-                pijk_f[i],
-                alt_f[i],
-            )
+        self.run.probes.extend_from_arrays(
+            probe_a0_f, probe_a1_f, probe_a2_f,
+            hijk_f, pijk_f, alt_f,
+        )
 
         # ── return natoms that gained access ─────────────────────────────
         return np.unique(np.concatenate([probe_a0_f, probe_a1_f, probe_a2_f]))
