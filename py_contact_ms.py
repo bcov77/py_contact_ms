@@ -1244,7 +1244,7 @@ class MolecularSurfaceCalculator:
         # NaN arithmetic on padding entries.
         rows, cols    = np.where(~exclude)                          # (S,)
         diff_active   = pijk_2q[rows] - coll_xyz[rows, cols]       # (S, 3)
-        d2_active     = (diff_active * diff_active).sum(axis=-1)   # (S,)
+        d2_active     = np.einsum('ij,ij->i', diff_active, diff_active)  # (S,) — single pass, no intermediate
         within_active = d2_active <= (coll_rad[rows, cols] + rp) ** 2
 
         # Scatter: any hit on a probe row marks that probe as colliding.
