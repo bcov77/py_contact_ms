@@ -1232,17 +1232,24 @@ class MolecularSurfaceCalculator:
         coll_rad   = self.run.neighbor_array.radius[na1_2q]  # (2Q, K)
         coll_natom = self.run.neighbor_array.natom[na1_2q]   # (2Q, K)
 
-        diff_c  = pijk_2q[:, None, :] - coll_xyz             # (2Q, K, 3)
-        d2_coll = np.einsum('pki,pki->pk', diff_c, diff_c)   # (2Q, K)
-
-        # exclude the two generating atoms (atom2 and atom3) and padding slots
-        exclude   = (
+        # Exclude the two generating atoms (atom2 and atom3) and NaN padding
+        # slots (natom < 0).  Active slots are guaranteed finite xyz and radius.
+        exclude = (
             (coll_natom == na2_2q[:, None]) |
             (coll_natom == na3_2q[:, None]) |
             (coll_natom < 0)
         )
-        within    = (d2_coll <= (coll_rad + rp)**2) & ~exclude & ~np.isnan(coll_rad)
-        collision = within.any(axis=-1)                      # (2Q,)
+
+        # Compute distances only for active (non-excluded) slots, avoiding all
+        # NaN arithmetic on padding entries.
+        rows, cols    = np.where(~exclude)                          # (S,)
+        diff_active   = pijk_2q[rows] - coll_xyz[rows, cols]       # (S, 3)
+        d2_active     = (diff_active * diff_active).sum(axis=-1)   # (S,)
+        within_active = d2_active <= (coll_rad[rows, cols] + rp) ** 2
+
+        # Scatter: any hit on a probe row marks that probe as colliding.
+        collision = np.zeros(len(pijk_2q), dtype=bool)
+        collision[rows[within_active]] = True
 
         valid_probe = ~collision
         if not np.any(valid_probe):
@@ -1452,8 +1459,8 @@ class MolecularSurfaceCalculator:
     def vec_check_point_collision(self, pcen, xyzs, rads):
 
         # skip first neighbor (matches C++ begin()+1)
-        dists = np.linalg.norm(xyzs - pcen, axis=-1)
-        collision = (dists <= (rads + self.settings.rp)) & ~np.isnan(rads) 
+        dists2 = np.square(xyzs - pcen).sum(axis=-1)
+        collision = (dists2 <= (rads + self.settings.rp)**2) & ~np.isnan(rads) 
 
         return collision[...,1:].any(axis=-1)
 
@@ -2160,7 +2167,7 @@ if __name__ == '__main__':
     d1    = calc.run.dots[1]
     dots1 = np.column_stack([d1.coor_x, d1.coor_y, d1.coor_z])
 
-    pr    = calc.run.probes
-    probes = np.column_stack([pr.point_x, pr.point_y, pr.point_z]) if len(pr) else np.empty((0, 3))
+    # pr    = calc.run.probes
+    # probes = np.column_stack([pr.point_x, pr.point_y, pr.point_z]) if len(pr) else np.empty((0, 3))
 
 
