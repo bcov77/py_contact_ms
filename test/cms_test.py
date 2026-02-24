@@ -284,7 +284,7 @@ def run_test():
 
     # 2. Run calculator
     binder_xyz, binder_radii, target_xyz, target_radii = partition_pose(pose)
-    cms, per_atom_cms, calc = calculate_contact_ms(binder_xyz, binder_radii, target_xyz, target_radii, return_calc=True)
+    cms, per_atom_cms, calc = calculate_contact_ms(binder_xyz, binder_radii, target_xyz, target_radii)
     print(f"CMS value: {cms:.6f}")
 
     # 3. Snapshot run state

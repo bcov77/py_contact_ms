@@ -1284,7 +1284,7 @@ class MolecularSurfaceCalculator:
 
         if np.any(degenerate):
             deg = degenerate
-            dtijk2_deg = np.linalg.norm(tij_q[deg] - a3_xyz_q[deg], axis=-1)
+            dtijk2_deg = np.square(tij_q[deg] - a3_xyz_q[deg]).sum(axis=-1) #this is a bug in the c++, should be squared
             rkp2_deg   = erk_q[deg]**2 - rij_q[deg]**2
             kills_q    = np.zeros(Q, dtype=bool)
             kills_q[deg] = dtijk2_deg < rkp2_deg
